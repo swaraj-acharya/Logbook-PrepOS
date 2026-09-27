@@ -1,7 +1,11 @@
 'use client';
 import { useEffect } from 'react';
 
-export type ClientConfig = { uid: string; login: string; ai: boolean; storage: string; canSignOut: boolean };
+/**
+ * uid: key for this browser's copy. server: account sync through /api/docs and /api/sync is available.
+ * sw: register the offline service worker (production builds). ai: the optional AI features are configured.
+ */
+export type ClientConfig = { uid: string; login: string; ai: boolean; storage: string; canSignOut: boolean; server: boolean; sw: boolean };
 
 /* The shell below is filled in by client/ui.js, which renders views into #main, #dock, #tabbar and the overlays. */
 export default function Logbook({ config }: { config: ClientConfig }) {
@@ -14,11 +18,11 @@ export default function Logbook({ config }: { config: ClientConfig }) {
     <>
       <div className="app">
         <nav className="rail" aria-label="Main">
-          <div className="brand">Logbook <small>study, recall, retain</small></div>
+          <div className="brand">Logbook PrepOS <small>plan, study, recall, practise</small></div>
           <button className="btn primary start" data-a="start-open" id="rail-start">Start study session</button>
           <div id="rail-links" />
           <div className="foot">
-            <span id="save-status">Opening…</span>
+            <button className="save-status" id="save-status" data-a="storage-open" title="Where your preparation is saved">Opening…</button>
             <span id="ai-status" />
             {config.canSignOut ? <a href="/api/auth/logout">Sign out{config.login && config.login !== 'you' ? ' ' + config.login : ''}</a> : null}
           </div>

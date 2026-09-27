@@ -1,14 +1,25 @@
 /*
- * Logbook browser UI. Renders views into the shell from components/Logbook.tsx and handles all interaction.
- * Pure logic lives in lib/engine.js; persistence goes through /api/docs and /api/sync.
+ * Logbook PrepOS browser UI. Renders views into the shell from components/Logbook.tsx and handles all interaction.
+ * Pure logic lives in lib/ (engine, roadmap, dayplan, lectures, practice, workspace). Persistence: a copy in this
+ * browser, the preparation file on this computer (lib/storage/local-file.ts) and, when the server is configured for
+ * it, the optional account sync through /api/docs and /api/sync. New views live in client/prep-ui.js.
  */
 import {
   MIN, HOUR, DAY, pad, clamp, uid, sum, ymd, dayKey, keyToDate, dayStart, addDays, daysBetween, weekStart, monthStart, monthKeyOf, rangeKeys,
   fmtDur, fmtClock, Memory, STATES, masteryOf, stateOf, topicStatus, MODE_GROUP, buildRollup, sumRange, splitOf, DEFAULT_MIX, DEFAULT_WEIGHTS,
   examPhase, reviewPriority, planDay, parseStudyText, parseDuration, parseDate, toks
 } from '../lib/engine.js';
-import { PALETTE, SEED_EE, SEED_PREREQ, ROADMAP_ORDER, ROADMAP_WHY, EVIDENCE, HEURISTICS, DATA_MODEL_TS, ARCH_NOTES } from '../lib/seed.js';
+import { PALETTE, EVIDENCE, HEURISTICS, DATA_MODEL_TS, ARCH_NOTES } from '../lib/seed.js';
 import { mergeDoc, differs } from '../lib/merge.js';
+import { migrateCore, newCore } from '../lib/workspace';
+import { calendarToday, isDateKey } from '../lib/dates';
+import { FileSync, idbKV, browserPickers } from '../lib/storage/local-file';
+import { candidates, keepOnRegenerate, buildDay, detectMissed, projectDays } from '../lib/dayplan';
+import { buildPhases, phaseOn, capacity, estimateWork, assessFeasibility, forecastCompletion, subjectOrder, subjectTimeline, coverageEnd,
+  requiredLearnShare, learnShare, adaptMix, minutesOn, isWeekendDay, lectureDates } from '../lib/roadmap';
+import { lectureLabels, lectureProgress, lectureStats, live as liveLectures } from '../lib/lectures';
+import { practiceSignal } from '../lib/practice';
+import * as PREP from './prep-ui.js';
 
 let CFG = {};
 const $ = (s, r = document) => r.querySelector(s);
@@ -29,8 +40,9 @@ const RETRY_STAGES = [[1, 'Short-delay retry'], [3, 'Independent retry'], [7, 'S
 const PROMPT_KINDS = [['free', 'Free recall'], ['formula', 'Formula'], ['blank', 'Fill in the blank'], ['explain', 'Explain why'], ['compare', 'Compare'], ['diagram', 'Draw from memory'], ['application', 'Application'], ['problem', 'Problem']];
 const PK_NAME = Object.fromEntries(PROMPT_KINDS);
 const LEVELS = [['basic', 'Basic'], ['standard', 'Standard'], ['advanced', 'Advanced'], ['unfamiliar', 'Unfamiliar']];
-const KIND_NAME = { review: 'Review', new: 'New learning', practice: 'Practice', mistakes: 'Mistakes', cumulative: 'Cumulative recall', break: 'Break' };
-const PHASE_TEXT = { early: 'Early phase: mostly new learning, with recall from day one.', middle: 'Middle phase: new learning, recall and practice together.', final: 'Final phase: revision, previous-year questions, mocks and mistakes.' };
+const KIND_NAME = { review: 'Review', new: 'New learning', practice: 'Practice', mistakes: 'Mistakes', cumulative: 'Cumulative recall', break: 'Break',
+  lecture: 'Lecture', selfstudy: 'Self-study', recall: 'Recall', qreview: 'Question review' };
+const PHASE_TEXT = { early: 'Early phase: mostly new learning, with recall from day one.', middle: 'Middle phase: new learning, recall and practice together.', final: 'Final phase: revision, saved questions, mock tests and mistakes.' };
 
 const DEFAULT_SETTINGS = {
   name: '', dailyMin: 120, weeklyMin: 840, monthlyMin: 3600, avail: null,
@@ -48,21 +60,52 @@ const Store = {
     try {
       const idx = JSON.parse(localStorage.getItem(LS + '__index') || '[]');
       for (const id of idx) { const raw = localStorage.getItem(LS + id); if (raw) this.docs[id] = JSON.parse(raw); }
+      if (!idx.length && !CFG.server) this.adoptLegacy();
     } catch (e) { /* storage unavailable: run in memory */ }
+  },
+  /* Browser-only mode after using the app with an account: take over the newest copy kept in this browser (it is copied, not moved). */
+  adoptLegacy() {
+    let best = null;
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i), m = /^lb1:(.+):__index$/.exec(k || '');
+      if (!m || 'lb1:' + m[1] + ':' === LS) continue;
+      try { const core = JSON.parse(localStorage.getItem('lb1:' + m[1] + ':core') || 'null'); if (core && (!best || (core.updatedAt || 0) > best.at)) best = { pre: 'lb1:' + m[1] + ':', at: core.updatedAt || 0 }; } catch (e) { /* skip */ }
+    }
+    if (!best) return;
+    const idx = JSON.parse(localStorage.getItem(best.pre + '__index') || '[]');
+    for (const id of idx) { const raw = localStorage.getItem(best.pre + id); if (raw) { this.docs[id] = JSON.parse(raw); this.saveLocal(id); } }
+    this.adopted = true;
   },
   saveLocal(id) {
     try {
       if (this.docs[id]) localStorage.setItem(LS + id, JSON.stringify(this.docs[id])); else localStorage.removeItem(LS + id);
       localStorage.setItem(LS + '__index', JSON.stringify(Object.keys(this.docs)));
-    } catch (e) { if (!this.warned.ls) { this.warned.ls = 1; toast('This browser could not keep a local copy. Saving to GitHub still works.'); } }
+    } catch (e) { if (!this.warned.ls) { this.warned.ls = 1; toast('This browser could not keep a local copy. Save to a preparation file to keep your work.'); } }
   },
   touch(id, now) {
     if (!this.docs[id]) return;
     this.docs[id].updatedAt = Date.now();
     this.dirty.add(id); this.saveLocal(id); invalidate();
     // Batch edits: one commit every few seconds at most, sooner for timer start/stop.
-    this.schedule(now ? 2500 : 8000);
+    if (this.remote) this.schedule(now ? 2500 : 8000);
+    if (FS) FS.markDirty();
     setSaveStatus();
+  },
+  /* Puts documents from the preparation file (or an opened copy) into the app without touching their timestamps. */
+  setDocs(docs, mode) {
+    if (mode === 'replace') {
+      for (const id of Object.keys(this.docs)) if (!(id in docs)) { delete this.docs[id]; if (this.remote) this.dirty.add(id); this.saveLocal(id); }
+      for (const id in docs) { this.docs[id] = docs[id]; this.saveLocal(id); if (this.remote) this.dirty.add(id); }
+    } else {
+      for (const id of new Set([...Object.keys(this.docs), ...Object.keys(docs)])) {
+        const merged = mergeDoc(id, this.docs[id], docs[id]);
+        if (differs(merged, this.docs[id])) { if (merged) this.docs[id] = merged; else delete this.docs[id]; this.saveLocal(id); if (this.remote) this.dirty.add(id); }
+      }
+    }
+    if (!this.docs.core) this.docs.core = freshCore();
+    normalizeCore(); invalidate(); ui.rev = null; ui.qrev = null;
+    if (this.remote && this.dirty.size) this.schedule(1500);
+    if (mounted) { if (!ui.modal || ui.modal.type === 'storage') render(); }
   },
   schedule(ms) {
     const at = Date.now() + ms;
@@ -115,6 +158,7 @@ const Store = {
     if (body.length < 60000) { try { fetch('/api/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }); } catch (e) { } }
   },
   async connect() {
+    if (!CFG.server) { this.mode = 'local'; setSaveStatus(); return; }
     let j;
     try {
       const r = await fetch('/api/docs', { cache: 'no-store' });
@@ -139,19 +183,34 @@ const Store = {
     normalizeCore(); invalidate(); render(); resumeCheck(); this.schedule(300);
   }
 };
-function setSaveStatus() {
-  const el = $('#save-status'); if (!el) return;
+/* One line describing where the latest changes are. The preparation file comes first; account sync is secondary. */
+function saveStatusInfo() {
+  const f = FS ? FS.status() : { state: 'nofile', fileName: null, message: '' };
   const where = CFG.storage && CFG.storage.startsWith('GitHub') ? 'GitHub' : 'the server';
-  el.textContent = Store.mode === 'account'
-    ? (Store.error ? 'Not saved to ' + where + ' yet: retrying' : Store.dirty.size || Store.flushing ? 'Saving to ' + where + '…' : 'Saved to ' + where)
-    : Store.mode === 'offline' ? 'Offline: saved in this browser' : Store.mode === 'signedout' ? 'Signed out: saved in this browser' : 'Opening…';
-  el.title = Store.error || '';
+  const server = Store.mode === 'account' ? (Store.error ? 'Not saved to ' + where + ' yet: retrying' : Store.dirty.size || Store.flushing ? 'Saving to ' + where + '…' : 'Saved to ' + where)
+    : Store.mode === 'offline' ? 'Offline: account sync paused' : Store.mode === 'signedout' ? 'Signed out: account sync paused' : '';
+  const name = f.fileName || 'the progress file';
+  const byState = { saved: ['ok', 'Saved to ' + name], saving: ['busy', 'Saving to ' + name + '…'], unsaved: ['busy', 'Unsaved changes'],
+    permission: ['warn', 'Permission required for ' + name], unavailable: ['bad', name + ' is unavailable'], failed: ['bad', 'Save failed'],
+    blocked: ['bad', 'Cannot read ' + name], idle: ['busy', 'Opening…'], nofile: Store.mode === 'account' ? ['ok', server] : ['warn', 'Not saved to a file yet'] };
+  const [tone, text] = byState[f.state] || ['warn', 'Not saved to a file yet'];
+  return { tone, text, file: f, server, detail: f.message || Store.error || '' };
+}
+function setSaveStatus() {
+  const info = saveStatusInfo();
+  for (const el of document.querySelectorAll('.save-status')) {
+    el.innerHTML = `<span class="sdot ${info.tone}" aria-hidden="true"></span><span>${esc(info.text)}</span>`;
+    el.title = [info.detail, info.server].filter(Boolean).join('. ');
+  }
+  const b = $('#storage-banner'); if (b) b.innerHTML = PREP.storageBanner(info);
 }
 
-function freshCore() { return { v: 1, settings: clone(DEFAULT_SETTINGS), exams: [], nodes: [], mem: {}, active: null, plan: null, createdAt: Date.now(), updatedAt: 0 }; }
+function freshCore() { return newCore(clone(DEFAULT_SETTINGS)); }
 function core() { return Store.docs.core || (Store.docs.core = freshCore()); }
 function normalizeCore() {
   const c = core();
+  const mig = migrateCore(c);
+  if (mig.warnings.length) mig.warnings.forEach(w => setTimeout(() => toast(w), 400));
   c.settings = Object.assign(clone(DEFAULT_SETTINGS), c.settings || {});
   c.settings.goal = Object.assign(clone(DEFAULT_SETTINGS.goal), c.settings.goal || {});
   c.settings.pomo = Object.assign(clone(DEFAULT_SETTINGS.pomo), c.settings.pomo || {});
@@ -160,6 +219,7 @@ function normalizeCore() {
   c.exams = c.exams || []; c.nodes = c.nodes || []; c.mem = c.mem || {};
   applyTheme();
 }
+let FS = null;          // the preparation file controller (created on mount)
 function applyTheme() {
   const t = core().settings.theme;
   if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t); else document.documentElement.removeAttribute('data-theme');
@@ -192,6 +252,9 @@ function addReview(r) { const [id, d] = mdoc('rev-', r.at, () => ({ reviews: [],
 function addPractice(p) { const [id, d] = mdoc('rev-', p.at, () => ({ reviews: [], practice: [] })); (d.practice || (d.practice = [])).push(p); Store.touch(id); }
 function saveMistake(m) { m.updatedAt = Date.now(); putItem('mis-', 'items', m.at, m); }
 function addTeach(t) { t.updatedAt = Date.now(); putItem('tb-', 'items', t.at, t); }
+function saveQuestion(q) { q.updatedAt = Date.now(); putItem('qs-', 'items', q.createdAt, q); }
+function addQAttempt(a) { const [id, d] = mdoc('rev-', a.at, () => ({ reviews: [], practice: [], qattempts: [] })); (d.qattempts || (d.qattempts = [])).push(a); Store.touch(id); }
+function removeQuestion(qid) { const r = findIn('qs-', 'items', qid); if (r) { r.arr[r.i] = { id: qid, gone: true, updatedAt: Date.now() }; Store.touch(r.docId); } delete core().qmem[qid]; Store.touch('core'); }
 function promptsFor(cid) { const sid = derive().subjOf[cid]; const d = Store.docs['pr-' + sid]; return (d && d.byConcept && d.byConcept[cid]) || []; }
 function setPrompts(cid, arr) {
   const sid = derive().subjOf[cid]; if (!sid) return;
@@ -226,6 +289,12 @@ function derive() {
   const practice = allOf('rev-', 'practice').sort((a, b) => a.at - b.at);
   const mistakes = allOf('mis-', 'items').sort((a, b) => b.at - a.at);
   const teach = allOf('tb-', 'items').sort((a, b) => a.at - b.at);
+  const questions = allOf('qs-', 'items').sort((a, b) => a.createdAt - b.createdAt);
+  const qattempts = allOf('rev-', 'qattempts').sort((a, b) => a.at - b.at);
+  const qById = {}, qAtt = {}; questions.forEach(q => { qById[q.id] = q; }); qattempts.forEach(a => (qAtt[a.qid] || (qAtt[a.qid] = [])).push(a));
+  const lectures = liveLectures(c.lectures || []).filter(l => byId[l.subjectId]).sort((a, b) => (orderIdx[a.subjectId] - orderIdx[b.subjectId]) || (a.order - b.order));
+  const lecLab = lectureLabels(lectures), lecOfC = {};
+  lectures.forEach(l => (l.conceptIds || []).forEach(cid => (lecOfC[cid] || (lecOfC[cid] = [])).push(l)));
   const I = {};
   const get = id => I[id] || (I[id] = { sessions: [], reviews: [], practice: [], mistakes: [], teach: [], sec: 0 });
   live.forEach(s => { (s.conceptIds || []).forEach(cid => get(cid).sessions.push(s)); splitOf(s).forEach(p => { if (p.c) get(p.c).sec += p.sec; }); });
@@ -242,8 +311,11 @@ function derive() {
   });
   const dependents = {};
   concepts.forEach(cn => (cn.prereq || []).forEach(p => (dependents[p] || (dependents[p] = [])).push(cn.id)));
-  DV = { now, today: dayKey(now, sh), sh, byId, kids, subjects, concepts, subjOf, topicOf, subtopicOf, orderIdx, archivedChain, dependents,
-    sessions, live, reviews, practice, mistakes, teach, I, cinfo, days: buildRollup(live, sh), EMPTY };
+  const lecEvidence = l => { let recalledAt = null, practicedAt = null; (l.conceptIds || []).forEach(cid => { const ix = I[cid]; if (!ix) return; ix.reviews.forEach(r => { if (r.g >= 2 && (!recalledAt || r.at > recalledAt)) recalledAt = r.at; }); ix.practice.forEach(p => { if (!practicedAt || p.at > practicedAt) practicedAt = p.at; }); }); return { recalledAt, practicedAt }; };
+  const lecProg = {}; lectures.forEach(l => { lecProg[l.id] = lectureProgress(l, lecEvidence(l)); });
+  DV = { now, today: dayKey(now, sh), cal: calendarToday(now), sh, byId, kids, subjects, concepts, subjOf, topicOf, subtopicOf, orderIdx, archivedChain, dependents,
+    sessions, live, reviews, practice, mistakes, teach, I, cinfo, days: buildRollup(live, sh), EMPTY,
+    questions, qattempts, qById, qAtt, lectures, lecLab, lecOfC, lecProg, lecEvidence };
   return DV;
 }
 const N = id => derive().byId[id];
@@ -252,7 +324,8 @@ function pathStr(id, from) { return pathParts(id).slice(from || 0).map(n => n.na
 function subjColor(sid) { const s = N(sid); return (s && s.color) || 'var(--faint)'; }
 function subjName(sid) { const s = N(sid); return s ? s.name : (sid === '_none' || !sid ? 'Mixed or unassigned' : 'Removed subject'); }
 function activeExam() { const c = core(); return c.exams.find(e => e.id === c.settings.activeExamId) || c.exams.find(e => !e.archived) || null; }
-function daysLeft() { const ex = activeExam(); return ex && ex.date ? daysBetween(derive().today, ex.date) : null; }
+/* The exam countdown follows the calendar (midnight), not the study day. */
+function daysLeft() { const ex = activeExam(); return ex && ex.date && isDateKey(ex.date) ? daysBetween(calendarToday(), ex.date) : null; }
 function examSubjects(withArchived, examId) {
   const d = derive(); const ex = examId === undefined ? activeExam() : (examId ? core().exams.find(e => e.id === examId) : null);
   return d.subjects.filter(s => (withArchived || !s.archived) && (!ex || !s.examIds || !s.examIds.length || s.examIds.includes(ex.id)));
@@ -288,69 +361,105 @@ function moveNode(id, dir) {
   const i = sibs.indexOf(n), j = i + dir; if (j < 0 || j >= sibs.length) return;
   sibs.splice(i, 1); sibs.splice(j, 0, n); sibs.forEach((s, k) => s.order = k); Store.touch('core');
 }
-function seedSyllabus(template, examId) {
-  const c = core(); const byName = {};
-  const existing = new Set(c.nodes.filter(n => n.kind === 'subject').map(n => n.name.toLowerCase()));
-  let order = c.nodes.filter(n => n.kind === 'subject').length;
-  template.forEach(([sname, imp, share, topics], si) => {
-    if (existing.has(sname.toLowerCase())) return;
-    const s = { id: uid('s'), kind: 'subject', parentId: null, name: sname, order: order++, examIds: examId ? [examId] : [], color: PALETTE[si % PALETTE.length], imp, share, createdAt: Date.now() };
-    c.nodes.push(s);
-    topics.forEach(([tname, cs], ti) => {
-      const t = { id: uid('t'), kind: 'topic', parentId: s.id, name: tname, order: ti, createdAt: Date.now() }; c.nodes.push(t);
-      cs.forEach((cname, ci) => { const n = { id: uid('c'), kind: 'concept', parentId: t.id, name: cname, order: ci, createdAt: Date.now() }; c.nodes.push(n); byName[cname] = n; });
-    });
-  });
-  for (const k in SEED_PREREQ) if (byName[k]) byName[k].prereq = SEED_PREREQ[k].map(p => byName[p] && byName[p].id).filter(Boolean);
-  Store.touch('core', true);
+/* ---------------- planning: adapters from live data to the pure planner (lib/dayplan.ts, lib/roadmap.ts) ---------------- */
+function extraPerDay() { const P = core().prep; return P.effort === 'extra' ? P.extraMinPerDay || 0 : 0; }
+function availOn(k) { return minutesOn(k, core().availability, extraPerDay()); }
+function windowsOn(k) { const A = core().availability; return (isWeekendDay(k, A) ? A.weekend.windows : A.weekday.windows) || []; }
+function subjectsPerDayOn(k) { const P = core().prep, A = core().availability; return isWeekendDay(k, A) ? P.subjectsPerDay.weekend : P.subjectsPerDay.weekday; }
+function openMistakes() { return derive().mistakes.filter(m => !m.resolved); }
+function questionSubject(q) { return q.subjectId || (q.conceptId ? derive().subjOf[q.conceptId] : null) || null; }
+/** Target share per subject (0–1): your planned % where set, otherwise importance and difficulty; rebalanced toward remaining work. */
+function subjectShares(subs, work) {
+  const byW = {}; (work ? work.subjects : []).forEach(w => { byW[w.id] = w.learnMin + w.practiceMin; });
+  const userTot = sum(subs.map(s => s.share > 0 ? s.share : 0));
+  const autoW = s => (s.imp || 2) * ({ 1: 0.85, 2: 1, 3: 1.25 }[s.diff || 2] || 1);
+  const autoSubs = subs.filter(s => !(s.share > 0)), autoTot = sum(autoSubs.map(autoW)) || 1;
+  const left = userTot >= 100 ? 0 : 100 - userTot;
+  const base = {}; subs.forEach(s => { base[s.id] = s.share > 0 ? s.share : (userTot ? left : 100) * autoW(s) / autoTot; });
+  const rems = subs.map(s => byW[s.id] || 0), mean = (sum(rems) / Math.max(1, rems.length)) || 1;
+  const dyn = {}; subs.forEach(s => { dyn[s.id] = base[s.id] * (work ? 0.5 + 0.5 * (byW[s.id] || 0) / mean : 1); });
+  const t = sum(Object.values(dyn)) || 1; for (const k in dyn) dyn[k] /= t;
+  return { base, dyn };
 }
-
-/* ---------------- planning context ---------------- */
-function planCtx(minutes) {
-  const d = derive(), c = core(), S = c.settings, now = d.now;
-  const subs = examSubjects(false); const subSet = new Set(subs.map(s => s.id));
-  const endToday = dayStart(addDays(d.today, 1), d.sh), startToday = dayStart(d.today, d.sh);
-  const wk = sumRange(d.days, addDays(d.today, -6), d.today);
-  const shareTot = sum(subs.map(s => s.share || 0)) || 1, secTot = sum(subs.map(s => wk.subj[s.id] || 0));
-  const deficit = {}; subs.forEach(s => deficit[s.id] = (s.share || 0) / shareTot - (secTot ? (wk.subj[s.id] || 0) / secTot : 0));
+function subjectWorkInput(s) {
+  const d = derive(), c = core();
+  const cs = conceptsUnder(s.id).filter(cn => !d.archivedChain[cn.id]);
+  const lecs = d.lectures.filter(l => l.subjectId === s.id);
+  const lecOpen = cid => (d.lecOfC[cid] || []).some(l => !d.lecProg[l.id].covered);
+  let sec = 0; d.live.forEach(x => splitOf(x).forEach(p => { if (p.s === s.id) sec += p.sec; }));
+  return { id: s.id, name: s.name, imp: s.imp || 2, diff: s.diff || 2, priority: s.priority || 2, estHours: s.estHours || null, studiedMin: sec / 60,
+    concepts: cs.map(cn => { const i = d.cinfo[cn.id] || { state: 0, ix: d.EMPTY }; const p = i.ix.practice, n = sum(p.map(x => x.n)); const m = c.mem[cn.id];
+      return { state: i.state, viaLecture: lecOpen(cn.id), imp: impOf(cn.id), acc: n ? sum(p.map(x => x.c)) / n : null, accN: n, S: m && m.S ? m.S : null }; }),
+    lectures: lecs.map(l => { const pg = d.lecProg[l.id]; return { min: l.min || null, watched: pg.watch, studied: pg.study, done: pg.covered }; }),
+    questions: d.questions.filter(q => questionSubject(q) === s.id).map(q => ({ S: (c.qmem[q.id] || {}).S || null })),
+    openMistakes: openMistakes().filter(m => (m.sid || d.subjOf[m.cid]) === s.id).map(m => ({ stage: m.stage || 0 })) };
+}
+/** Everything the roadmap, forecast and dashboards need, computed once per data change. */
+function model() {
+  const d = derive(); if (d.model) return d.model;
+  const c = core(), S = c.settings, P = c.prep, A = c.availability;
+  const ex = activeExam(), cal = d.cal, dl = daysLeft();
+  const start = ex && ex.startDate && ex.startDate < cal ? ex.startDate : (ex && ex.startDate) || cal;
+  const phases = ex && ex.date && isDateKey(ex.date) ? buildPhases(start <= cal ? start : cal, ex.date) : [];
+  const phase = phaseOn(phases, cal);
+  const mixes = normMix(S.mix), mixKey = phase ? phase.mixKey : examPhase(dl);
+  const cap = ex && ex.date && dl != null && dl > 0 ? capacity(cal, ex.date, A, { extraPerDay: extraPerDay(), todayKey: cal, studiedTodayMin: studiedSec() / 60 }) : { total: 0, days: 0, studyDays: 0, weekdayStudyDays: 0, weekendStudyDays: 0, restDays: 0, perDay: [] };
+  const subs = examSubjects(false);
+  const work = estimateWork(subs.map(subjectWorkInput), { daysLeft: dl == null ? 180 : Math.max(0, dl), prep: P, minPerReview: S.minPerReview });
+  const feas = assessFeasibility({ work, cap, av: A, daysLeft: dl, subjects: subs.map(s => ({ id: s.id, name: s.name, imp: s.imp || 2, priority: s.priority || 2 })) });
+  const shares = subjectShares(subs, work);
+  const covEnd = coverageEnd(phases);
+  const req = requiredLearnShare(work.learnMin, cap, covEnd);
+  const days = cap.perDay.map(x => { const ph = phaseOn(phases, x.k); return { k: x.k, learn: x.min * learnShare(ph ? ph.key : null, req, mixes[ph ? ph.mixKey : 'middle']) }; });
+  const r14 = sumRange(d.days, addDays(d.today, -13), d.today);
+  const recentLearn = ((r14.mode.lecture || 0) + (r14.mode.reading || 0) + (r14.mode.notes || 0)) / 60 / 14;
+  const forecast = phases.length ? forecastCompletion({ today: cal, learnRemainingMin: work.learnMin, days: cap.perDay, phases, base: mixes[mixKey], recentLearnMinPerDay: recentLearn }) : null;
+  const order = subjectOrder(subs.map(s => ({ id: s.id, name: s.name, order: d.orderIdx[s.id], imp: s.imp || 2, priority: s.priority || 2, prereqSubjects: s.prereqSubjects || [] })));
+  const learnMin = {}; work.subjects.forEach(w => { learnMin[w.id] = w.learnMin; });
+  const prereq = {}; subs.forEach(s => { prereq[s.id] = s.prereqSubjects || []; });
+  const timeline = subjectTimeline({ order, learnMin, weight: shares.dyn, prereq, days, parallel: P.subjectsPerDay.weekday || 0 });
+  const subSet = new Set(subs.map(s => s.id));
+  const lec = lectureStats(d.lectures.filter(l => subSet.has(l.subjectId)), d.today, { sh: d.sh, defaultMin: P.defaultLectureMin, baseline: c.roadmap, evidence: d.lecEvidence });
+  const newShare = learnShare(phase ? phase.key : null, req, mixes[mixKey]);
+  const mix = adaptMix(mixes[mixKey], mixKey === 'final' ? Math.min(newShare, mixes.final.new) : newShare);
+  return d.model = { ex, dl, cal, phases, phase, mixKey, mix, cap, work, feas, forecast, order, timeline, lec, shares, days, covEnd, subs };
+}
+/** A plain-data picture of the syllabus and memory for the pure planner. */
+function makeSnapshot() {
+  const d = derive(), c = core(), S = c.settings, m = model();
+  const subs = m.subs, subSet = new Set(subs.map(s => s.id));
   const cs = d.concepts.filter(cn => subSet.has(d.subjOf[cn.id]) && isLiveConcept(cn));
-  const st = id => d.cinfo[id].state;
-  const prereqOK = cn => (cn.prereq || []).every(p => !d.cinfo[p] || d.cinfo[p].state >= 1);
-  // New learning: continue subjects already in progress, favour under-covered subjects, follow syllabus order,
-  // and alternate between the top two subjects so one day is not spent on a single subject.
-  const started = {}; cs.forEach(cn => { if (st(cn.id) >= 1) started[d.subjOf[cn.id]] = true; });
-  const fresh = cs.filter(cn => st(cn.id) === 0);
-  const pri = sid => (deficit[sid] || 0) + (started[sid] ? 0.05 : 0);
-  const subOrder = [...new Set(fresh.map(cn => d.subjOf[cn.id]))].sort((a, b) => (pri(b) - pri(a)) || (d.orderIdx[a] - d.orderIdx[b]));
-  const queues = subOrder.map(sid => fresh.filter(cn => d.subjOf[cn.id] === sid).sort((a, b) => (prereqOK(b) - prereqOK(a)) || (d.orderIdx[a.id] - d.orderIdx[b.id])));
-  const newCands = [];
-  const top = queues.slice(0, 2), rest = queues.slice(2);
-  let moreN = true; while (moreN) { moreN = false; for (const q of top) if (q.length) { newCands.push(q.shift()); moreN = true; } }
-  rest.forEach(q => newCands.push(...q));
-  newCands.forEach((cn, i) => newCands[i] = { cid: cn.id, sid: d.subjOf[cn.id] });
-  const targets = new Set(cs.filter(cn => st(cn.id) >= 1 && st(cn.id) <= 3).map(cn => cn.id).concat(newCands.slice(0, 5).map(x => x.cid)));
-  const isPrereq = cid => (d.dependents[cid] || []).some(x => targets.has(x));
-  const due = cs.filter(cn => c.mem[cn.id] && c.mem[cn.id].due < endToday).map(cn => {
-    const m = c.mem[cn.id], R = d.cinfo[cn.id].R;
-    const it = { cid: cn.id, sid: d.subjOf[cn.id], R, overdueDays: Math.max(0, daysBetween(dayKey(m.due, d.sh), d.today)), ivl: m.ivl || 1, imp: impOf(cn.id), lapses: m.lapses || 0, isPrereq: isPrereq(cn.id), overdue: m.due < startToday };
-    it.score = reviewPriority(it, S.weights);
-    it.critical = it.overdue && ((R != null && R < 0.7) || it.imp === 3 || it.isPrereq);
-    return it;
-  }).sort((a, b) => b.score - a.score);
-  const acc = cid => { const p = d.cinfo[cid].ix.practice; const n = sum(p.map(x => x.n)); return n ? sum(p.map(x => x.c)) / n : null; };
-  const practiceCands = cs.filter(cn => { const s = st(cn.id); if (s < 2 || s > 5) return false; const a = acc(cn.id); return a == null || a < 0.75 || s < 5; })
-    .sort((a, b) => ((deficit[d.subjOf[b.id]] || 0) - (deficit[d.subjOf[a.id]] || 0)) || ((acc(a.id) ?? -1) - (acc(b.id) ?? -1)))
-    .map(cn => ({ cid: cn.id, sid: d.subjOf[cn.id] }));
-  const mistakesDue = d.mistakes.filter(m => !m.resolved && m.next < endToday).map(m => ({ id: m.id, cid: m.cid }));
-  const older = cs.filter(cn => st(cn.id) >= 3 && c.mem[cn.id] && c.mem[cn.id].due >= endToday && c.mem[cn.id].last && now - c.mem[cn.id].last > 5 * DAY)
-    .sort((a, b) => c.mem[a.id].last - c.mem[b.id].last);
-  const bySub = {}; older.forEach(cn => (bySub[d.subjOf[cn.id]] || (bySub[d.subjOf[cn.id]] = [])).push(cn));
-  const cumulativeCands = []; let more = true;
-  while (more && cumulativeCands.length < 20) { more = false; for (const k in bySub) if (bySub[k].length) { const cn = bySub[k].shift(); cumulativeCands.push({ cid: cn.id, sid: k }); more = true; } }
-  const formulaCands = cs.filter(cn => st(cn.id) >= 1 && (cn.formula || promptsFor(cn.id).some(p => p.kind === 'formula'))).map(cn => ({ cid: cn.id, sid: d.subjOf[cn.id] }));
-  const before = d.live.filter(s => s.startedAt < startToday).slice(-1)[0];
-  const lastStudyGapDays = before ? daysBetween(dayKey(before.startedAt, d.sh), d.today) : 0;
-  return { minutes, daysLeft: daysLeft(), mix: normMix(S.mix), minPerReview: S.minPerReview, due, newCands, practiceCands, mistakesDue, cumulativeCands, formulaCands, lastStudyGapDays, deficit };
+  const learned = {}, total = {}; cs.forEach(cn => { const sid = d.subjOf[cn.id]; total[sid] = (total[sid] || 0) + 1; if (d.cinfo[cn.id].state >= 1) learned[sid] = (learned[sid] || 0) + 1; });
+  const wl = {}; m.work.subjects.forEach(w => { wl[w.id] = w.learnMin; });
+  const exposure = {};
+  for (let i = 0; i < 14; i++) { const k = addDays(d.today, -i), x = d.days[k]; if (x) { exposure[k] = {}; for (const sid in x.subj) exposure[k][sid] = x.subj[sid] / 60; } }
+  const a = c.active; if (a) { const sid = sesSubject(a); if (sid) { const e = exposure[d.today] || (exposure[d.today] = {}); e[sid] = (e[sid] || 0) + focusNow(a) / 60; } }
+  const lastStudied = {}; d.live.forEach(x => splitOf(x).forEach(p => { if (p.s) lastStudied[p.s] = dayKey(x.startedAt, d.sh); }));
+  const startToday = dayStart(d.today, d.sh), before = d.live.filter(x => x.startedAt < startToday).slice(-1)[0];
+  const lecOpen = cid => (d.lecOfC[cid] || []).some(l => !d.lecProg[l.id].covered);
+  const since7 = d.now - 7 * DAY;
+  return {
+    now: d.now, today: d.today, sh: d.sh,
+    subjects: subs.map(s => ({ id: s.id, name: s.name, order: d.orderIdx[s.id], imp: s.imp || 2, priority: s.priority || 2, share: m.shares.dyn[s.id] || 0,
+      prereqSubjects: s.prereqSubjects || [], targetDate: s.targetDate || null, learnedFrac: total[s.id] ? (learned[s.id] || 0) / total[s.id] : 0, learnLeftMin: wl[s.id] || 0 })),
+    concepts: cs.map(cn => { const i = d.cinfo[cn.id]; return { id: cn.id, sid: d.subjOf[cn.id], order: d.orderIdx[cn.id], name: cn.name, prereq: cn.prereq || [], imp: impOf(cn.id), state: i.state,
+      mem: c.mem[cn.id] || null, practice: i.ix.practice.map(p => ({ n: p.n, c: p.c, at: p.at })), formula: !!(cn.formula || promptsFor(cn.id).some(p => p.kind === 'formula')),
+      viaLecture: c.prep.mode === 'lectures' && lecOpen(cn.id), lapses: (c.mem[cn.id] || {}).lapses || 0 }; }),
+    lectures: d.lectures.filter(l => subSet.has(l.subjectId)).map(l => { const pg = d.lecProg[l.id]; return { id: l.id, sid: l.subjectId, order: l.order, label: d.lecLab[l.id].label, min: l.min || null,
+      cids: (l.conceptIds || []).filter(x => d.byId[x]), watched: pg.watch, studied: pg.study, recalled: pg.recall, done: pg.covered, watchedAt: l.watchedAt || null }; }),
+    mistakes: openMistakes().map(x => ({ id: x.id, cid: x.cid || null, sid: x.sid || d.subjOf[x.cid] || null, next: x.next, stage: x.stage || 0 })),
+    questions: d.questions.filter(q => { const sid = questionSubject(q); return !sid || subSet.has(sid); }).map(q => ({ id: q.id, sid: questionSubject(q), cid: q.conceptId || null, mem: c.qmem[q.id] || null,
+      recentWrong: (d.qAtt[q.id] || []).some(x => x.result === 'incorrect' && x.at >= since7) })),
+    exposure, lastStudied, lastStudyGapDays: before ? daysBetween(dayKey(before.startedAt, d.sh), d.today) : 0,
+    weights: S.weights, minPerReview: S.minPerReview, memOpts: { retention: S.retention, sh: d.sh, maxIvl: maxIvlNow() }
+  };
+}
+/* Kept for the Review view, badges and the coach: the same candidate lists the planner uses. */
+function planCtx(minutes) {
+  const d = derive(), S = core().settings, snap = makeSnapshot();
+  const C = candidates(snap, d.today, {});
+  return { minutes, daysLeft: daysLeft(), mix: normMix(S.mix), minPerReview: S.minPerReview, due: C.due, newCands: C.newCands, practiceCands: C.practiceCands,
+    mistakesDue: C.mistakesDue, cumulativeCands: C.cumulativeCands, formulaCands: C.formulaCands, lastStudyGapDays: snap.lastStudyGapDays, deficit: C.deficit };
 }
 function normMix(mix) {
   const out = {};
@@ -359,20 +468,81 @@ function normMix(mix) {
 }
 function firstDayKey() { const d = derive(); const ks = Object.keys(d.days).sort(); return ks.length ? ks[0] : d.today; }
 function studiedSec(k) { const d = derive(); const x = d.days[k || d.today]; let sec = x ? x.sec : 0; const a = core().active; if (a && (!k || k === d.today)) sec += focusNow(a); return sec; }
+function nowMinOfDay() { const t = new Date(); return t.getHours() * 60 + t.getMinutes(); }
+/** Options for building one day. Today starts from the current time; future days use the kept tasks pinned to them. */
+function dayOptsFor(k, isToday, minutes, keep) {
+  const c = core(), m = model(), ex = m.ex;
+  const ph = phaseOn(m.phases, k), mixes = normMix(c.settings.mix), mk = ph ? ph.mixKey : m.mixKey;
+  const dl = ex && ex.date ? daysBetween(k, ex.date) : null;
+  const mix = mk === m.mixKey ? m.mix : adaptMix(mixes[mk], learnShare(ph ? ph.key : null, requiredLearnShare(m.work.learnMin, m.cap, m.covEnd), mixes[mk]));
+  return { minutes, windows: windowsOn(k), fromMin: isToday ? nowMinOfDay() + 5 : null, phase: ph, mixKey: mk, mix, daysLeft: dl, prep: c.prep,
+    subjectsPerDay: subjectsPerDayOn(k), minSession: c.availability.minSession, keep: keep || [], id: uid };
+}
+/** A finished day's plan, with every task in full, for missed-day checks, the weekly review and the progress file's day records. */
+function planHistorySummary(p) {
+  const tasks = (p.blocks || []).filter(b => b.kind !== 'break').map(b => {
+    const t = { kind: b.kind, min: b.min, status: b.status === 'skipped' ? 'skipped' : blockDoneIn(p, b) ? 'done' : 'todo', subjectId: b.subjectId || null, lectureId: b.lectureId || null,
+      key: b.key, title: b.title, start: b.start || null, end: b.end || null, why: (b.why || []).slice(0, 4) };
+    if (b.locked) t.locked = true; if (b.manual) t.manual = true; if (b.fromDay) t.fromDay = b.fromDay;
+    const pr = Math.round((p.progress || {})[b.key] || 0); if (pr && t.status !== 'done') t.progressMin = pr;
+    return t;
+  });
+  return { date: p.date, plannedMin: sum(tasks.filter(t => t.status !== 'skipped').map(t => t.min)), doneMin: sum(tasks.filter(t => t.status === 'done').map(t => t.min)),
+    studiedMin: Math.round(studiedSec(p.date) / 60), avail: p.avail, notes: (p.notes || []).slice(0, 6), tasks };
+}
+/** When a new day starts: yesterday's plan goes to history (for missed-day checks and the weekly review). */
+function rolloverPlans() {
+  const c = core(), d = derive(); let changed = false;
+  if (c.plan && c.plan.date && c.plan.date < d.today) { c.planHistory[c.plan.date] = planHistorySummary(c.plan); c.plan = null; changed = true; }
+  // tasks you moved to a day that has passed without opening the app still count as planned (and not done) that day
+  for (const k of Object.keys(c.dayPlans || {})) if (k < d.today) { if (!c.planHistory[k] && (c.dayPlans[k].blocks || []).length) c.planHistory[k] = planHistorySummary(Object.assign({ progress: {} }, c.dayPlans[k], { date: k })); delete c.dayPlans[k]; changed = true; }
+  const keys = Object.keys(c.planHistory).sort(); if (keys.length > 400) { keys.slice(0, keys.length - 400).forEach(k => delete c.planHistory[k]); changed = true; }
+  if (changed) Store.touch('core');
+}
+function missedInfo() {
+  const d = derive(), c = core(); const studied = {};
+  for (const k in d.days) studied[k] = d.days[k].sec / 60;
+  const since = Object.keys(c.planHistory).sort()[0] || firstDayKey();
+  return detectMissed({ today: d.today, history: c.planHistory, studiedMin: studied, av: c.availability, since, lookback: 14 });
+}
 function ensurePlan(force, avail) {
   const c = core(), d = derive();
+  rolloverPlans();
   if (!force && c.plan && c.plan.date === d.today && avail == null) return c.plan;
-  const A = avail != null ? avail : (c.plan && c.plan.date === d.today ? c.plan.avail : (c.settings.avail || c.settings.dailyMin));
-  const base = Math.round(studiedSec() / 60);
-  const minutes = c.plan && c.plan.date === d.today ? Math.max(0, A - base) : A;
-  const p = planDay(planCtx(minutes));
-  const keepProgress = c.plan && c.plan.date === d.today ? c.plan.progress : {};
-  c.plan = { date: d.today, avail: A, base: c.plan && c.plan.date === d.today ? base : 0, phase: p.phase, notes: p.notes, blocks: p.blocks, progress: {}, done: {}, generatedAt: Date.now() };
-  if (keepProgress && force) c.plan.prevMinutes = sum(Object.values(keepProgress));
+  const same = c.plan && c.plan.date === d.today;
+  const A = avail != null ? avail : same ? c.plan.avail : (availOn(d.today) || c.settings.avail || c.settings.dailyMin);
+  const studied = Math.round(studiedSec() / 60);
+  let keep = same ? keepOnRegenerate(c.plan.blocks || [], b => blockDoneIn(c.plan, b)) : [];
+  if (!same && c.dayPlans[d.today]) { keep = keepOnRegenerate(c.dayPlans[d.today].blocks || [], () => false); delete c.dayPlans[d.today]; }
+  const missed = !same ? missedInfo() : { streak: 0 };
+  const res = buildDay(makeSnapshot(), d.today, Object.assign(dayOptsFor(d.today, true, Math.max(0, A - studied), keep), { recoveryDays: missed.streak || 0 }));
+  const progress = {}; if (same) for (const b of res.tasks) if (c.plan.progress[b.key] != null) progress[b.key] = c.plan.progress[b.key];
+  c.plan = { date: d.today, avail: A, base: studied, phase: res.phase, roadmapPhase: (model().phase || {}).key || null, notes: res.notes, blocks: res.tasks,
+    progress, done: {}, subjects: res.subjects, generatedAt: Date.now() };
+  if (same && c.plan.prevMinutes == null) c.plan.prevMinutes = 0;
   Store.touch('core');
   return c.plan;
 }
-function blockDone(b) { const p = core().plan; return !!(p && ((p.done || {})[b.key] || (p.progress[b.key] || 0) >= b.min * 0.8)); }
+/** The coming days, planned on a simulated copy of your data (today comes from the saved plan). Not saved. */
+function projectWeek(n) {
+  const d = derive(), c = core(); ensurePlan(false);
+  const snap = makeSnapshot();
+  const first = addDays(d.today, 1);
+  const days = projectDays(snap, first, Math.max(0, (n || 7) - 1), k => dayOptsFor(k, false, availOn(k), keepOnRegenerate(((c.dayPlans || {})[k] || {}).blocks || [], () => false)));
+  return [{ date: d.today, tasks: c.plan.blocks, notes: c.plan.notes || [], subjects: c.plan.subjects || [], today: true }].concat(days);
+}
+/** Saves the current roadmap as the baseline that progress is compared against ("Re-plan from today"). */
+function rebaseline() {
+  const c = core(), m = model(), d = derive();
+  const lecBySub = {}; d.lectures.filter(l => !d.lecProg[l.id].covered).forEach(l => (lecBySub[l.subjectId] || (lecBySub[l.subjectId] = [])).push(l.id));
+  const ld = lectureDates(lecBySub, m.timeline.rows, m.days);
+  d.lectures.filter(l => d.lecProg[l.id].covered).forEach(l => { ld[l.id] = dayKey(d.lecProg[l.id].completedAt || d.now, d.sh); });
+  const subjects = {}; for (const id in m.timeline.rows) subjects[id] = { start: m.timeline.rows[id].start, end: m.timeline.rows[id].end };
+  c.roadmap = { at: Date.now(), examDate: m.ex && m.ex.date || null, subjects, lectures: ld, coverageEnd: m.covEnd, requiredMin: m.feas.requiredMin, availableMin: m.feas.availableMin };
+  Store.touch('core');
+}
+function blockDoneIn(p, b) { return !!(p && b && (b.status === 'done' || (p.done || {})[b.key] || (p.progress[b.key] || 0) >= b.min * 0.8)); }
+function blockDone(b) { return blockDoneIn(core().plan, b); }
 
 /* ---------------- timer (time always derived from timestamps) ---------------- */
 function focusNow(a, t) { t = t || Date.now(); return Math.max(0, (t - a.startedAt) / 1000 - (a.pausedSec || 0) - (a.pausedAt ? (t - a.pausedAt) / 1000 : 0) - (a.idleSec || 0)); }
@@ -384,7 +554,8 @@ function startSession(f) {
   const mins = st[0] === 'stopwatch' || st[0] === 'pomodoro' ? 0 : (parseFloat(f.minutes) || st[2]);
   const a = { id: uid('ss'), examId: f.examId || (activeExam() || {}).id || null, subjectId: f.subjectId || null, topicId: f.topicId || null, subtopicId: f.subtopicId || null,
     conceptIds: (f.conceptIds || []).slice(0, 40), mode: f.mode || 'mixed', style: st[0], targetSec: mins ? Math.round(mins * 60) : null,
-    startedAt: Date.now(), pausedAt: null, pauseReason: null, pausedSec: 0, breakSec: 0, idleSec: 0, confBefore: f.confBefore || null, goal: f.goal || '', blockKey: f.blockKey || null, notes: '' };
+    startedAt: Date.now(), pausedAt: null, pauseReason: null, pausedSec: 0, breakSec: 0, idleSec: 0, confBefore: f.confBefore || null, goal: f.goal || '', blockKey: f.blockKey || null, notes: '',
+    lectureId: f.lectureId || null, taskId: f.taskId || null, taskKind: f.taskKind || null, qids: (f.qids || []).slice(0, 60) };
   if (st[0] === 'pomodoro') { const P = c.settings.pomo; a.pomo = { focus: P.focus, brk: P.brk, long: P.longBrk, every: P.every, cycle: 1, phase: 'focus', mark: 0 }; }
   c.active = a; beat(); Store.touch('core', true);
   if (st[0] === 'deep' || st[0] === 'mock') ui.focus = true;
@@ -411,13 +582,14 @@ function stopSession(at) {
   const s = { id: a.id, examId: a.examId, subjectId: a.subjectId, topicId: a.topicId, subtopicId: a.subtopicId, conceptIds: a.conceptIds.slice(),
     startedAt: a.startedAt, endedAt: t, elapsedSec: Math.round((t - a.startedAt) / 1000), pausedSec: Math.round(a.pausedSec), breakSec: Math.round(a.breakSec), idleExcludedSec: Math.round(a.idleSec),
     focusSec: focus, mode: a.mode, timerStyle: a.style, targetSec: a.targetSec, source: 'timer', confidenceBefore: a.confBefore, notes: a.notes || '', goal: a.goal || '',
-    planBlock: a.blockKey, selfReportedSec: a.selfReportedSec || null, status: a.targetSec && focus >= a.targetSec ? 'completed' : 'stopped', createdAt: Date.now() };
+    planBlock: a.blockKey, taskId: a.taskId || null, lectureId: a.lectureId || null, taskKind: a.taskKind || null, qids: a.qids || [],
+    selfReportedSec: a.selfReportedSec || null, status: a.targetSec && focus >= a.targetSec ? 'completed' : 'stopped', createdAt: Date.now() };
   c.active = null;
   s.conceptIds.forEach(cid => { if (!c.mem[cid]) c.mem[cid] = { state: 'new', due: dayStart(addDays(d.today, 1), d.sh), reps: 0, lapses: 0, ok: 0, fail: 0 }; });
   if (a.blockKey && c.plan && c.plan.date === d.today) c.plan.progress[a.blockKey] = (c.plan.progress[a.blockKey] || 0) + focus / 60;
   saveSession(s, true); Store.touch('core', true);
   try { localStorage.removeItem(LS + 'beat'); } catch (e) { }
-  document.title = 'Logbook';
+  document.title = 'Logbook PrepOS';
   return s;
 }
 function chime() {
@@ -540,7 +712,9 @@ const ui = {
   coach: { msgs: [], busy: false, ctl: null },
   revOpt: { subj: '', mixed: true, count: 20 }
 };
-const NAV = [['today', 'Today'], ['review', 'Review'], ['subjects', 'Subjects'], ['mistakes', 'Mistakes'], ['history', 'History'], ['calendar', 'Calendar'], ['insights', 'Insights'], ['coach', 'Coach'], ['method', 'Method'], ['settings', 'Settings']];
+const NAV = [['today', 'Today'], ['plan', 'Plan'], ['review', 'Review'], ['practice', 'Practice'], ['subjects', 'Subjects'], ['lectures', 'Lectures'], ['mistakes', 'Mistakes'],
+  ['week', 'Weekly review'], ['history', 'History'], ['calendar', 'Calendar'], ['insights', 'Insights'], ['coach', 'Coach'], ['method', 'Method'], ['settings', 'Settings']];
+const HIDDEN_VIEWS = ['subject', 'setup', 'welcome'];
 const ICO = {
   today: '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>',
   review: '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3M4.5 4.5v4h4"/></svg>',
@@ -604,7 +778,7 @@ function go(view, param) {
 }
 function routeFromHash() {
   const h = (location.hash || '#today').slice(1).split('/');
-  ui.view = NAV.some(n => n[0] === h[0]) ? h[0] : (h[0] === 'subject' ? 'subject' : 'today');
+  ui.view = NAV.some(n => n[0] === h[0]) || HIDDEN_VIEWS.includes(h[0]) ? h[0] : 'today';
   ui.param = h[1] || null;
 }
 
@@ -615,24 +789,29 @@ function renderNav() {
   const cur = ui.view === 'subject' ? 'subjects' : ui.view;
   let due = 0, mdue = 0;
   try { due = dueCount(); mdue = misDue().length; } catch (e) { }
-  const badge = { review: due, mistakes: mdue };
+  let qdue = 0; try { qdue = PREP.questionsDueCount(); } catch (e) { }
+  const badge = { review: due, mistakes: mdue, practice: qdue };
   $('#rail-links').innerHTML = NAV.map(([k, name]) => `<a href="#${k}"${cur === k ? ' aria-current="page"' : ''}>${name}${badge[k] ? `<span class="badge">${badge[k]}</span>` : ''}</a>`).join('');
   const a = core().active;
   const rs = $('#rail-start');
   if (rs) { rs.textContent = a ? 'Session running' : 'Start study session'; rs.className = 'btn start ' + (a ? 'live' : 'primary'); rs.dataset.a = a ? 'focus-open' : 'start-open'; }
-  const inMore = !['today', 'review', 'subjects'].includes(cur);
+  const inMore = !['today', 'plan', 'review'].includes(cur);
   $('#tabbar').innerHTML = `
     <a href="#today"${cur === 'today' ? ' aria-current="page"' : ''}>${ICO.today}Today</a>
-    <a href="#review"${cur === 'review' ? ' aria-current="page"' : ''}>${ICO.review}Review${due ? ' ' + due : ''}</a>
+    <a href="#plan"${cur === 'plan' ? ' aria-current="page"' : ''}>${ICO.subjects}Plan</a>
     ${a ? `<button class="go on" data-a="focus-open" aria-label="Open running timer"><span id="tab-time">${fmtClock(focusNow(a))}</span></button>` : `<button class="go" data-a="start-open">Start</button>`}
-    <a href="#subjects"${cur === 'subjects' ? ' aria-current="page"' : ''}>${ICO.subjects}Subjects</a>
+    <a href="#review"${cur === 'review' ? ' aria-current="page"' : ''}>${ICO.review}Review${due ? ' ' + due : ''}</a>
     <button data-a="more-open"${inMore ? ' aria-current="page"' : ''}>${ICO.more}More</button>`;
 }
 function renderMain() {
   const m = $('#main');
-  const fn = { today: viewToday, review: viewReview, subjects: viewSubjects, subject: viewSubject, mistakes: viewMistakes, history: viewHistory, calendar: viewCalendar, insights: viewInsights, coach: viewCoach, method: viewMethod, settings: viewSettings }[ui.view] || viewToday;
+  const needsSetup = !core().prep.setupDone && !derive().subjects.length;
+  let view = ui.view;
+  if (needsSetup && !['setup', 'settings', 'method'].includes(view)) view = 'welcome';
+  const fn = { today: PREP.viewDashboard, plan: PREP.viewPlan, practice: PREP.viewPractice, lectures: PREP.viewLectures, week: PREP.viewWeek, setup: PREP.viewWizard, welcome: PREP.viewWelcome,
+    review: viewReview, subjects: viewSubjects, subject: viewSubject, mistakes: viewMistakes, history: viewHistory, calendar: viewCalendar, insights: viewInsights, coach: viewCoach, method: viewMethod, settings: viewSettings }[view] || PREP.viewDashboard;
   const y = window.scrollY;
-  try { m.innerHTML = fn(); }
+  try { m.innerHTML = `<div id="storage-banner">${PREP.storageBanner(saveStatusInfo())}</div>` + fn(); }
   catch (e) { console.error(e); m.innerHTML = `<div class="empty"><h2>Something went wrong on this page</h2><p class="muted">${esc(e && e.message)}</p><button class="btn" data-a="nav" data-v="today">Back to Today</button></div>`; }
   const key = ui.view + '/' + (ui.param || '');
   if (key !== lastView) { window.scrollTo(0, 0); lastView = key; } else window.scrollTo(0, y);
@@ -693,24 +872,6 @@ function updateClocks() {
 /* =====================================================================
    TODAY
    ===================================================================== */
-function viewOnboard() {
-  const f = ui.onb || (ui.onb = { date: '2027-02-06', name: 'GATE EE' });
-  return `<div class="page-head"><div><h1>Set up your syllabus</h1>
-    <p>Logbook tracks subjects, topics and concepts, times every study session, and schedules recall so you remember what you studied. Start from a template or build your own.</p></div></div>
-  <div class="grid2">
-    <div class="panel stack"><h3>GATE Electrical Engineering template</h3>
-      <p class="muted small">Eleven subjects from the official EE syllabus, split into topics and concepts, with prerequisite links. Everything is editable afterwards.</p>
-      <label class="f">Exam date<input type="date" id="onb-date" value="${esc(f.date)}"></label>
-      <p class="tiny muted">GATE 2027 runs on 6, 7, 13, 14, 20 and 21 February 2027. Set the date of your paper once the schedule is out.</p>
-      <div><button class="btn primary" data-a="onboard-ee">Load GATE EE syllabus</button></div></div>
-    <div class="panel stack"><h3>Start empty</h3>
-      <p class="muted small">For ESE, PSU, RRB JE, SSC JE, state AE/JE or any other exam. Create the exam now and add subjects next.</p>
-      <label class="f">Exam name<input type="text" id="onb-name" value="${esc(f.name === 'GATE EE' ? '' : f.name)}" placeholder="For example, SSC JE Electrical"></label>
-      <label class="f">Exam date (optional)<input type="date" id="onb-date2"></label>
-      <div><button class="btn" data-a="onboard-empty">Create exam and add subjects</button></div></div>
-  </div>
-  <section class="block note blue">You can also start the timer right away without any syllabus: press <b>Start study session</b> and pick nothing. The time is recorded as unassigned and can be edited later.</section>`;
-}
 function todayLearning() {
   const d = derive(), k = d.today;
   const rv = d.reviews.filter(r => dayKey(r.at, d.sh) === k);
@@ -728,70 +889,6 @@ function planBlockSub(b) {
   if (b.kind === 'practice' && b.interleaved) return 'Interleaved: ' + names;
   return names || (b.kind === 'cumulative' ? 'Older concepts across subjects' : '');
 }
-function viewToday() {
-  const d = derive(), c = core(), S = c.settings;
-  if (!d.subjects.length) return viewOnboard();
-  const ex = activeExam(), dl = daysLeft(), plan = ensurePlan(false), ctx = planCtx(0);
-  const L = todayLearning(), studied = studiedSec();
-  const overdue = ctx.due.filter(x => x.overdue).length, critical = ctx.due.filter(x => x.critical).length;
-  const risk = riskList();
-  const newPlanned = sum(plan.blocks.filter(b => b.kind === 'new').map(b => b.cids.length));
-  const phase = examPhase(dl);
-  const lede = ex ? `${esc(ex.name)}${dl != null ? `: <b>${dl >= 0 ? plural(dl, 'day') + ' to go' : 'exam date has passed'}</b>.` : '.'} ${PHASE_TEXT[phase]}` : 'No exam selected. Add one in Settings to get phase-aware plans.';
-  const totalPlan = sum(plan.blocks.map(b => b.min)) || 1;
-  const strip = plan.blocks.map(b => { const done = blockDone(b), prog = Math.min(1, (plan.progress[b.key] || 0) / b.min);
-    return `<span class="k-${b.kind}${done ? ' done' : ''}" style="flex:${b.min}" title="${esc(KIND_NAME[b.kind])}, ${b.min} min"><span class="fill" style="width:${done ? 0 : prog * 100}%"></span><span style="position:relative">${b.min >= totalPlan * 0.12 ? esc(KIND_NAME[b.kind]) : ''}</span></span>`; }).join('');
-  const blocks = plan.blocks.map(b => {
-    const done = blockDone(b), got = Math.round(plan.progress[b.key] || 0);
-    return `<div class="li${done ? ' done' : ''}"><span class="mins">${b.min}m</span><span class="sw k-${b.kind}"></span>
-      <div class="grow"><div class="title">${esc(b.title)}</div><div class="sub">${esc(planBlockSub(b))}${got && !done ? `. ${got} of ${b.min} min done, ${Math.max(0, b.min - got)} left` : ''}</div></div>
-      ${b.kind === 'break' ? '' : `<button class="btn sm${done ? '' : ' primary'}" data-a="block-start" data-k="${b.key}"${c.active ? ' disabled' : ''}>${done ? 'Again' : 'Start'}</button>`}
-      <button class="iconbtn" data-a="block-done" data-k="${b.key}" aria-label="${done ? 'Mark not done' : 'Mark done'}">${done ? 'Undo' : 'Done'}</button></div>`;
-  }).join('') || '<div class="li"><span class="muted">Nothing left to plan today. Rest counts too.</span></div>';
-  const availOpts = [10, 15, 20, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360].map(v => opt(v, v < 60 ? v + ' minutes' : (v / 60) + (v === 60 ? ' hour' : ' hours'), plan.avail)).join('');
-  const bySub = Object.assign({}, (d.days[d.today] || {}).subj || {});
-  const a = c.active; if (a) { const sid = sesSubject(a) || '_none'; bySub[sid] = (bySub[sid] || 0) + focusNow(a); }
-  const subEntries = Object.entries(bySub).filter(x => x[1] >= 30).sort((x, y) => y[1] - x[1]);
-  const maxSub = subEntries.length ? subEntries[0][1] : 1;
-  const wk = sumRange(d.days, addDays(d.today, -6), d.today);
-  const subs = examSubjects(false), shareTot = sum(subs.map(s => s.share || 0));
-  let balance = '';
-  if (wk.sec >= 3 * 3600 && shareTot) {
-    const devs = subs.map(s => ({ s, dev: (wk.subj[s.id] || 0) / wk.sec - (s.share || 0) / shareTot })).sort((x, y) => y.dev - x.dev);
-    const over = devs[0], under = devs.filter(x => x.dev < -0.08).slice(-2).reverse();
-    if (over && over.dev > 0.15 && under.length) balance = `<div class="note">This week ${Math.round((wk.subj[over.s.id] || 0) / wk.sec * 100)}% of your time went to ${esc(over.s.name)} (planned about ${Math.round(over.s.share / shareTot * 100)}%). If ${esc(under.map(x => x.s.name).join(' and '))} ${under.length > 1 ? 'are' : 'is'} still a priority, the plan already leans toward ${under.length > 1 ? 'them' : 'it'} for new learning.</div>`;
-  }
-  const todaySes = L.sessions.slice().reverse();
-  return `<div class="today-head"><div class="date">${fmtDayLong(d.today)}</div><h1>${greeting()}${S.name ? ', ' + esc(S.name) : ''}</h1><p class="lede">${lede}</p></div>
-  <section class="block"><div class="stats">
-    ${stat(fmtDur(S.dailyMin * 60), "Today's time target")}${stat(`<span class="live-today">${fmtDur(studied)}</span>`, 'Studied today')}
-    ${stat(ctx.due.length, 'Reviews due')}${stat(risk.length, 'High-risk concepts')}${stat(newPlanned, 'New concepts planned')}${stat(misDue().length, 'Mistakes to retry')}</div>
-    <div class="row" style="margin-top:22px">${a ? '<button class="btn lg live" data-a="focus-open">Back to the running session</button>' : `<button class="btn lg primary" data-a="plan-start">Start today's plan</button><button class="btn lg" data-a="start-open">Start study session</button>`}</div></section>
-  <section class="block"><div class="spread"><h2>Today's plan</h2>
-      <div class="row"><label class="small muted" for="avail">Time available today</label><select id="avail" data-c="plan-avail" style="width:auto">${availOpts}</select><button class="btn sm" data-a="plan-rebuild">Rebuild</button></div></div>
-    <div class="strip" aria-hidden="true">${strip}</div>
-    ${plan.base ? `<p class="small muted" style="margin-top:8px">You had already studied ${fmtDur(plan.base * 60)} when this plan was made, so it covers the remaining time.</p>` : ''}
-    ${(plan.notes || []).map(n => `<div class="note blue" style="margin-top:10px">${esc(n)}</div>`).join('')}
-    <div class="list blocks" style="margin-top:6px">${blocks}</div>
-    <p class="tiny muted">Studying longer than planned is recorded but never adds to tomorrow's workload. Stopping early just leaves the rest here.</p></section>
-  <section class="block"><div class="meters">
-    <div class="panel meter"><div class="top"><h3>Time goal</h3><b><span class="live-today">${fmtDur(studied)}</span> of ${fmtDur(S.dailyMin * 60)}</b></div>
-      <div class="bar"><i style="width:${Math.min(100, studied / (S.dailyMin * 60) * 100)}%;background:var(--live)"></i></div>
-      <p class="small muted">${studied >= S.dailyMin * 60 ? 'Time target reached.' : fmtDur(S.dailyMin * 60 - studied) + ' to go.'} Time spent is not the same as learning, so both are shown.</p></div>
-    <div class="panel meter"><div class="top"><h3>Learning goal</h3><b>${[L.newConcepts >= S.goal.newConcepts, L.reviews >= S.goal.reviews, L.q >= S.goal.questions].filter(Boolean).length} of 3</b></div>
-      ${hbar('New concepts', 'var(--k-new)', L.newConcepts, S.goal.newConcepts, L.newConcepts + ' / ' + S.goal.newConcepts)}
-      ${hbar('Recalls', 'var(--k-review)', L.reviews, S.goal.reviews, L.reviews + ' / ' + S.goal.reviews)}
-      ${hbar('Questions', 'var(--k-practice)', L.q, S.goal.questions, L.q + ' / ' + S.goal.questions)}</div></div></section>
-  <section class="block"><div class="spread"><h2>Review debt</h2><a class="btn sm" href="#review">Open review</a></div>
-    <div class="panel"><div class="debt">${stat(ctx.due.length, 'Due')}${stat(overdue, 'Overdue')}${stat(critical, 'Critical')}
-      <p class="small muted">${ctx.due.length ? 'Sorted by forgetting risk, importance and prerequisites. Clear the critical ones first; the rest can wait a day without harm.' : 'Nothing due. New learning and practice fill today.'}</p></div>
-      ${risk.length ? `<div class="hr"></div><div class="sheet-label">Most at risk of being forgotten</div><div class="list">${risk.slice(0, 5).map(cn => `<div class="li clickable" data-a="concept" data-id="${cn.id}"><span class="dot" style="background:${subjColor(d.subjOf[cn.id])}"></span><div class="grow"><div class="title">${esc(cn.name)}</div><div class="sub">${esc(pathStr(cn.id).split(' › ').slice(0, -1).join(' › '))}</div></div><span class="small">Est. recall ${pct(d.cinfo[cn.id].R)}</span></div>`).join('')}</div>` : ''}</div></section>
-  <section class="block"><div class="spread"><h2>Today by subject</h2><button class="btn sm" data-a="day-open" data-k="${d.today}">Close the day</button></div>
-    ${subEntries.length ? `<div class="panel">${subEntries.map(([sid, sec]) => hbar(esc(subjName(sid)), sid === '_none' ? 'var(--faint)' : subjColor(sid), sec, maxSub, fmtDur(sec))).join('')}
-      <div class="hr"></div><div class="spread"><b>Total</b><b class="num" style="font-size:22px"><span class="live-today">${fmtDur(studied)}</span></b></div></div>` : '<p class="muted">No study recorded yet today.</p>'}
-    ${balance}
-    ${todaySes.length ? `<div class="list" style="margin-top:12px">${todaySes.map(sesRow).join('')}</div>` : ''}</section>`;
-}
 function sesRow(s) {
   const sid = sesSubject(s);
   return `<div class="li clickable" data-a="ses-edit" data-id="${s.id}"><span class="dot" style="background:${sid ? subjColor(sid) : 'var(--faint)'}"></span>
@@ -801,17 +898,32 @@ function sesRow(s) {
 function blockStart(key) {
   const c = core(), p = c.plan; const b = p && p.blocks.find(x => x.key === key); if (!b) return;
   const d = derive(); const subs = [...new Set(b.cids.map(x => d.subjOf[x]).filter(Boolean))];
-  const sid = subs.length === 1 ? subs[0] : null;
+  const sid = b.subjectId || (subs.length === 1 ? subs[0] : null);
+  const link = { blockKey: b.key, taskId: b.id || null, taskKind: b.kind, lectureId: b.lectureId || null };
+  if (b.kind === 'lecture' || b.kind === 'selfstudy') {
+    const l = b.lectureId && d.lectures.find(x => x.id === b.lectureId);
+    const f = Object.assign({ examId: (activeExam() || {}).id || '', subjectId: sid || (l && l.subjectId) || '', topicId: (l && l.topicId) || '', subtopicId: '', conceptIds: b.cids.slice(),
+      mode: b.kind === 'lecture' ? 'lecture' : 'reading', style: 'focus', minutes: b.min }, link);
+    if (f.subjectId && f.conceptIds.length) { const t = new Set(f.conceptIds.map(x => d.topicOf[x])); if (t.size === 1) f.topicId = [...t][0] || f.topicId; }
+    openStart(f); return;
+  }
+  if (b.kind === 'recall') { PREP.openLectureRecall(b.lectureId, b.key); return; }
+  if (b.kind === 'qreview') {
+    const qids = (b.qids || []).filter(id => d.qById[id]);
+    if (!qids.length) { toast('Those questions are no longer due. Mark this task done.'); return; }
+    if (!c.active) startSession(Object.assign({ mode: 'practice', style: 'focus', minutes: b.min, conceptIds: [], subjectId: sid, qids }, link));
+    PREP.beginQuestionReview(qids, { fromPlan: b.key }); go('practice'); return;
+  }
   if (b.kind === 'review' || b.kind === 'cumulative') {
     if (!b.cids.length) { toast('Nothing to recall in this block. Mark it done.'); return; }
-    if (!c.active) startSession({ mode: 'recall', style: 'focus', minutes: b.min, conceptIds: b.cids, subjectId: sid, blockKey: b.key });
+    if (!c.active) startSession(Object.assign({ mode: 'recall', style: 'focus', minutes: b.min, conceptIds: b.cids, subjectId: sid }, link));
     beginReview(b.cids, { mixed: true, fromPlan: true }); go('review'); return;
   }
   if (b.kind === 'mistakes') {
-    if (!c.active) startSession({ mode: 'mistakes', style: 'focus', minutes: b.min, conceptIds: b.cids, subjectId: sid, blockKey: b.key });
+    if (!c.active) startSession(Object.assign({ mode: 'mistakes', style: 'focus', minutes: b.min, conceptIds: b.cids, subjectId: sid }, link));
     ui.mis.filter = 'due'; go('mistakes'); return;
   }
-  const f = { examId: (activeExam() || {}).id || '', subjectId: sid || '', topicId: '', subtopicId: '', conceptIds: b.cids.slice(), mode: b.kind === 'practice' ? 'practice' : 'reading', style: 'focus', minutes: b.min, blockKey: b.key };
+  const f = Object.assign({ examId: (activeExam() || {}).id || '', subjectId: sid || '', topicId: '', subtopicId: '', conceptIds: b.cids.slice(), mode: b.kind === 'practice' ? 'practice' : 'reading', style: 'focus', minutes: b.min }, link);
   if (sid && b.cids.length) { const t = new Set(b.cids.map(x => d.topicOf[x])); if (t.size === 1) f.topicId = [...t][0]; }
   openStart(f);
 }
@@ -961,7 +1073,8 @@ function subjStats(sid) {
   d.live.forEach(s => { let hit = false; splitOf(s).forEach(p => { if (p.s === sid) { sec += p.sec; hit = true; } }); if (hit) n++; });
   const end = dayStart(addDays(d.today, 1), d.sh);
   const due = cs.filter(cn => c.mem[cn.id] && c.mem[cn.id].due < end);
-  const weak = cs.filter(cn => { const i = info(cn); return (i.mastery.value != null && i.mastery.value < 0.5) || (i.m && (i.m.lapses || 0) >= 2) || (i.R != null && i.R < 0.6); });
+  const weak = cs.filter(cn => { const i = info(cn); const ps = i.ix ? practiceSignal({ practice: i.ix.practice, recall: i.R, state: i.state }) : null;
+    return (i.mastery.value != null && i.mastery.value < 0.5) || (i.m && (i.m.lapses || 0) >= 2) || (i.R != null && i.R < 0.6) || (ps && ps.signal === 'weak-application'); });
   return { cs, states, mastery: ms.length ? sum(ms) / ms.length : null, masteryN: ms.length, sec, n, due, weak,
     started: states.filter(s => s >= 1).length, retrieved: states.filter(s => s >= 3).length, stable: states.filter(s => s >= 6).length, mastered: states.filter(s => s >= 7).length,
     topics: (d.kids[sid] || []).filter(k => k.kind === 'topic').length };
@@ -977,10 +1090,10 @@ function viewSubjects() {
   const all = examSubjects(true, exFilter || null);
   const shown = all.filter(s => o.showArch || !s.archived);
   const archN = all.filter(s => s.archived).length;
-  const head = `<div class="page-head"><div><h1>Subjects</h1><p>Exam, subject, topic, subtopic, concept. One subject can belong to several exams, so shared concepts are learned once and count for all of them.</p></div>
-    <div class="row"><button class="btn primary" data-a="subj-add">Add subject</button></div></div>
+  const head = `<div class="page-head"><div><h1>Subjects</h1><p>Exam, subject, topic, subtopic, concept. Add as much or as little structure as you know; a subject alone is enough to plan with. One subject can belong to several exams.</p></div>
+    <div class="row"><button class="btn" data-a="import-open">Import syllabus</button><button class="btn primary" data-a="subj-add">Add subject</button></div></div>
     <div class="tabs" role="tablist"><button role="tab" aria-selected="${o.listTab === 'list'}" data-a="subj-listtab" data-v="list">Subjects</button><button role="tab" aria-selected="${o.listTab === 'roadmap'}" data-a="subj-listtab" data-v="roadmap">Roadmap</button></div>`;
-  if (o.listTab === 'roadmap') return head + viewRoadmap();
+  if (o.listTab === 'roadmap') return head + PREP.viewSubjectRoadmap();
   const chips = `<div class="chips" style="margin-bottom:14px">${chip('All exams', !exFilter, 'data-a="subj-exam" data-v=""')}${c.exams.filter(e => !e.archived).map(e => chip(esc(e.name), exFilter === e.id, `data-a="subj-exam" data-v="${e.id}"`)).join('')}${archN ? chip('Show archived (' + archN + ')', o.showArch, 'data-a="subj-arch"') : ''}</div>`;
   if (!shown.length) return head + chips + `<div class="empty"><p>No subjects for this exam yet.</p><button class="btn primary" data-a="subj-add">Add subject</button></div>`;
   const rows = shown.map(s => {
@@ -996,39 +1109,21 @@ function viewSubjects() {
   return head + chips + `<div class="panel tight"><div class="list">${rows}</div></div>
     <p class="tiny muted" style="margin-top:10px">Bar: grey started, blue retrieved at least once, green stable. Estimated mastery averages only concepts with enough evidence and is an estimate, not a grade.</p>`;
 }
-function viewRoadmap() {
-  const d = derive(), ex = activeExam(), dl = daysLeft();
-  const subs = examSubjects(false);
-  const idx = s => { const i = ROADMAP_ORDER.findIndex(n => n.toLowerCase() === s.name.toLowerCase()); return i < 0 ? 100 + (s.order || 0) : i; };
-  const ordered = subs.slice().sort((a, b) => idx(a) - idx(b));
-  let phases = '';
-  if (ex && ex.date) {
-    const fs = addDays(ex.date, -60), ms = addDays(ex.date, -180);
-    const cur = examPhase(dl);
-    const seg = (k, name, a, b, text) => `<div class="panel tight" style="${cur === k ? 'border:2px solid var(--blue)' : ''}"><b>${name}</b>${cur === k ? ' <span class="tag edited">Now</span>' : ''}<div class="small muted">${a ? fmtDay(a) : 'Until'} to ${fmtDay(b)}</div><p class="small" style="margin-top:6px">${text}</p></div>`;
-    phases = `<div class="grid3">${seg('early', 'Early', null, ms, 'Mostly new learning, with recall from day one.')}${seg('middle', 'Middle', ms, fs, 'Learning, retrieval and practice together.')}${seg('final', 'Final', fs, ex.date, 'Revision, previous-year questions, mocks and mistakes.')}</div>`;
-  }
-  const rows = ordered.map((s, i) => {
-    const topics = (d.kids[s.id] || []).filter(t => t.kind === 'topic' && !t.archived);
-    const counts = {};
-    topics.forEach(t => { const stx = topicStatus(conceptsUnder(t.id).map(cn => (d.cinfo[cn.id] || { state: 0 }).state)); counts[stx] = (counts[stx] || 0) + 1; });
-    const why = ROADMAP_WHY[ROADMAP_ORDER.find(n => n.toLowerCase() === s.name.toLowerCase())] || '';
-    return `<div class="li" style="align-items:flex-start"><span class="num" style="font-size:26px;width:34px">${i + 1}</span><div class="grow"><div class="title clickable" data-a="nav" data-v="subject/${s.id}">${dot(s.color)} ${esc(s.name)}</div>
-      ${why ? `<p class="small muted" style="margin:3px 0 6px">${esc(why)}</p>` : ''}
-      <div class="row small">${['Not started', 'Learning', 'Reviewing', 'Practicing', 'Stable', 'Mastered'].filter(k => counts[k]).map(k => `<span class="tag">${k} ${counts[k]}</span>`).join(' ') || '<span class="muted">No topics</span>'}</div></div></div>`;
-  }).join('');
-  return `${phases ? `<section class="block" style="margin-top:0"><h2 style="margin-bottom:12px">Phases to ${esc(ex.name)}</h2>${phases}</section>` : '<div class="note">Set an exam date in Settings to see preparation phases.</div>'}
-    <section class="block"><div class="spread"><h2>Suggested order</h2><button class="btn sm" data-a="roadmap-apply">Use this order for my subjects</button></div>
-      <p class="small muted" style="margin-bottom:10px">Based on prerequisite links in the syllabus (a product heuristic, not an experiment). General Aptitude runs as a short daily track alongside everything else. Topic status: learning, reviewing, practicing, stable, mastered, from your recall and practice data.</p>
-      <div class="panel tight"><div class="list">${rows || '<div class="li muted">No subjects yet.</div>'}</div></div></section>`;
-}
 function viewSubject() {
   const d = derive(), s = d.byId[ui.param];
   if (!s) return `<div class="empty"><p>This subject no longer exists.</p><a class="btn" href="#subjects">All subjects</a></div>`;
   const st = subjStats(s.id), tab = ui.subj.tab;
-  const tabs = [['syllabus', 'Syllabus'], ['time', 'Time'], ['weak', 'Weak and due'], ['history', 'History']];
+  const tabs = [['syllabus', 'Syllabus'], ['lectures', 'Lectures'], ['questions', 'Questions'], ['resources', 'Resources'], ['time', 'Time'], ['weak', 'Weak and strong'], ['history', 'History']];
   let body = '';
   if (tab === 'syllabus') body = syllabusTree(s);
+  else if (tab === 'lectures') body = PREP.subjectLecturesHTML(s.id);
+  else if (tab === 'questions') body = PREP.subjectQuestionsHTML(s.id);
+  else if (tab === 'resources') {
+    const topics = (d.kids[s.id] || []).filter(t => t.kind === 'topic' && !t.archived);
+    body = `<div class="panel stack">${PREP.resourcesHTML({ kind: 'subject', id: s.id })}</div>
+      ${topics.length ? `<div class="stack" style="margin-top:14px">${topics.map(t => { const k = (core().resources || []).filter(r => !r.gone && (r.on || []).some(o => o.kind === 'topic' && o.id === t.id)).length; return `<details class="panel tight"${k ? ' open' : ''}><summary>${esc(t.name)} (${k})</summary><div style="margin-top:10px">${PREP.resourcesHTML({ kind: 'topic', id: t.id })}</div></details>`; }).join('')}</div>` : ''}
+      <p class="tiny muted" style="margin-top:8px">Concept resources are in each concept's dialog; lecture resources in the lecture's dialog.</p>`;
+  }
   else if (tab === 'time') {
     const tt = {}; d.live.forEach(x => splitOf(x).forEach(p => { if (p.s === s.id) { if (p.t) tt[p.t] = (tt[p.t] || 0) + p.sec; if (p.u) tt[p.u] = (tt[p.u] || 0) + p.sec; if (!p.t && !p.u) tt._ = (tt._ || 0) + p.sec; } }));
     const topics = (d.kids[s.id] || []).filter(t => t.kind === 'topic');
@@ -1038,7 +1133,9 @@ function viewSubject() {
       <p class="tiny muted" style="margin-top:8px">Sessions that cover several concepts split their time evenly between them.</p>`;
   } else if (tab === 'weak') {
     const lst = (arr, empty) => arr.length ? `<div class="list">${arr.map(cn => `<div class="li clickable" data-a="concept" data-id="${cn.id}"><div class="grow"><div class="title">${esc(cn.name)}</div><div class="sub">${esc(pathStr(cn.id, 1).split(' › ').slice(0, -1).join(' › '))}</div></div>${stateTag(d.cinfo[cn.id].state)}<span class="small muted">${d.cinfo[cn.id].R != null ? 'Est. recall ' + pct(d.cinfo[cn.id].R) : ''}</span></div>`).join('')}</div>` : `<p class="muted small">${empty}</p>`;
-    body = `<h3 style="margin-bottom:6px">Due for review</h3>${lst(st.due, 'Nothing due.')}<h3 style="margin:22px 0 6px">Weak</h3><p class="tiny muted">Low estimated mastery, low estimated recall, or forgotten twice or more.</p>${lst(st.weak, 'No weak concepts detected yet. That may just mean there is little evidence so far.')}`;
+    const strong = st.cs.filter(cn => { const i = d.cinfo[cn.id]; return i && i.mastery.value != null && i.mastery.value >= 0.8 && i.state >= 5; });
+    body = `<h3 style="margin-bottom:6px">Due for review</h3>${lst(st.due, 'Nothing due.')}<h3 style="margin:22px 0 6px">Weak</h3><p class="tiny muted">Low estimated mastery, low estimated recall, forgotten twice or more, or weak on practice questions.</p>${lst(st.weak, 'No weak concepts detected yet. That may just mean there is little evidence so far.')}
+      <h3 style="margin:22px 0 6px">Strong</h3>${lst(strong, 'No concept is both applied and above 80% estimated mastery yet.')}`;
   } else {
     const ses = d.live.filter(x => splitOf(x).some(p => p.s === s.id)).slice(-60).reverse();
     body = ses.length ? `<div class="list">${ses.map(x => sesRowDated(x)).join('')}</div>` : '<p class="muted">No sessions yet.</p>';
@@ -1046,7 +1143,7 @@ function viewSubject() {
   return `<div class="page-head"><div><a href="#subjects" class="small">All subjects</a><h1 style="margin-top:6px">${dot(s.color)} ${esc(s.name)}</h1><p>${examTags(s) || 'Not linked to an exam'}${s.desc ? ' ' + esc(s.desc) : ''}</p></div>
     <div class="row"><button class="btn primary" data-a="start-subject" data-id="${s.id}">Start session</button><button class="btn" data-a="subj-edit" data-id="${s.id}">Edit</button>
       <button class="btn" data-a="node-archive" data-id="${s.id}">${s.archived ? 'Unarchive' : 'Archive'}</button><button class="btn danger" data-a="node-del" data-id="${s.id}">Delete</button></div></div>
-    <div class="stats">${stat(fmtDur(st.sec), 'Total study')}${stat(st.n, 'Sessions')}${stat(st.topics, 'Topics')}${stat(st.cs.length, 'Concepts')}${stat(st.mastered, 'Mastered')}${stat(st.weak.length, 'Weak')}${stat(st.due.length, 'Review due')}${stat(st.mastery == null ? '–' : pct(st.mastery), 'Estimated mastery')}</div>
+    ${PREP.subjectDashboardHTML(s.id, st)}
     <section class="block"><div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button role="tab" aria-selected="${tab === k}" data-a="subj-tab" data-v="${k}">${l}</button>`).join('')}</div>${body}</section>`;
 }
 function sesRowDated(s) {
@@ -1077,10 +1174,11 @@ function syllabusTree(s) {
   return `<div class="tree">${html || '<p class="muted">No topics yet.</p>'}</div>
     <div class="row" style="margin-top:22px"><input type="text" id="new-topic" placeholder="New topic name" style="max-width:320px" data-enter="topic-add" data-id="${s.id}"><button class="btn" data-a="topic-add" data-id="${s.id}">Add topic</button></div>`;
 }
+/* Reorders subjects to the roadmap order: prerequisites first, then priority and importance. */
 function applyRoadmapOrder() {
+  const order = model().order, pos = new Map(order.map((id, i) => [id, i]));
   const subs = core().nodes.filter(n => n.kind === 'subject');
-  const idx = s => { const i = ROADMAP_ORDER.findIndex(n => n.toLowerCase() === s.name.toLowerCase()); return i < 0 ? 100 + (s.order || 0) : i; };
-  subs.sort((a, b) => idx(a) - idx(b)).forEach((s, i) => s.order = i);
+  subs.sort((a, b) => (pos.has(a.id) ? pos.get(a.id) : 1e3 + (a.order || 0)) - (pos.has(b.id) ? pos.get(b.id) : 1e3 + (b.order || 0))).forEach((s, i) => s.order = i);
   Store.touch('core'); toast('Subjects reordered.');
 }
 
@@ -1116,9 +1214,10 @@ function modalConcept() {
       <div class="row small" style="margin:6px 0 12px">${LEVELS.map(([k, l]) => byLv[k] ? `<span class="tag">${l}: ${byLv[k][1]} of ${byLv[k][0]}</span>` : '').join(' ') || '<span class="muted">No attempts logged yet.</span>'}</div>
       <div class="panel stack"><div class="grid3"><label class="f">Level<select data-c="fv" data-k="lv">${LEVELS.map(l => opt(l[0], l[1], f.lv || 'standard')).join('')}</select></label>
         <label class="f">Questions tried<input type="number" min="1" data-c="fv" data-k="pn" value="${esc(f.pn || '')}"></label><label class="f">Correct<input type="number" min="0" data-c="fv" data-k="pc" value="${esc(f.pc || '')}"></label></div>
-        <div class="grid2"><label class="f">Minutes (optional)<input type="number" min="0" data-c="fv" data-k="pmin" value="${esc(f.pmin || '')}"></label><label class="f">Source (optional)<input type="text" data-c="fv" data-k="psrc" placeholder="GATE 2019 PYQ, workbook…" value="${esc(f.psrc || '')}"></label></div>
+        <div class="grid2"><label class="f">Minutes (optional)<input type="number" min="0" data-c="fv" data-k="pmin" value="${esc(f.pmin || '')}"></label><label class="f">Source (optional)<input type="text" data-c="fv" data-k="psrc" placeholder="Previous paper, workbook, test series…" value="${esc(f.psrc || '')}"></label></div>
         <div><button class="btn primary sm" data-a="pa-add">Log practice</button></div></div>
       <div class="list" style="margin-top:10px">${pr.map(p => `<div class="li"><div class="grow"><div class="title" style="font-weight:400">${p.c} of ${p.n} correct, ${esc((LEVELS.find(l => l[0] === p.lv) || [0, p.lv])[1])}</div><div class="sub">${fmtDate(p.at)}${p.min ? ', ' + p.min + ' min' : ''}${p.src ? ', ' + esc(p.src) : ''}</div></div></div>`).join('')}</div>`;
+    body = PREP.conceptQuestionsHTML(id) + body;
   } else if (tab === 'teach') {
     const tb = ix.teach.slice().reverse(); const res = M.tbRes;
     body = `<p class="small muted">Explain the concept as if teaching a friend, without notes. Explaining why and how is one of the better-supported ways to find gaps.</p>
@@ -1145,11 +1244,9 @@ function modalConcept() {
     body = `<div class="spread"><p class="small muted">Mistakes tied to this concept come back for staged retries.</p><button class="btn sm" data-a="mis-add" data-cid="${id}">Log a mistake</button></div>
       <div class="list">${ix.mistakes.map(misRow).join('') || '<div class="li muted">None logged.</div>'}</div>`;
   } else if (tab === 'resources') {
-    const rs = n.resources || [];
-    body = `${rs.length >= 3 ? `<div class="note">You already have ${rs.length} resources here. Another one rarely helps as much as recalling and practicing with what you have. Learn, recall, practice first.</div>` : ''}
-      <div class="list">${rs.map(r => `<div class="li"><span class="tag">${esc(r.kind || 'Link')}</span><div class="grow"><div class="title">${r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title || r.url)}</a>` : esc(r.title)}</div></div><button class="iconbtn" data-a="res-del" data-rid="${r.id}">Remove</button></div>`).join('') || '<div class="li small muted">None yet. Resources are optional; the app tracks what you learned, not where.</div>'}</div>
-      <div class="panel stack" style="margin-top:10px"><div class="grid3"><label class="f">Kind<select data-c="fv" data-k="rk">${['Video', 'Book', 'PDF', 'Course', 'Notes', 'Class material', 'AI explanation', 'Link'].map(k => opt(k, k, f.rk || 'Video')).join('')}</select></label>
-        <label class="f">Title<input type="text" data-c="fv" data-k="rt" value="${esc(f.rt || '')}"></label><label class="f">Link (optional)<input type="url" data-c="fv" data-k="ru" value="${esc(f.ru || '')}"></label></div><div><button class="btn sm" data-a="res-add">Add resource</button></div></div>`;
+    const rs = n.resources || [], all = rs.length + (core().resources || []).filter(r => !r.gone && (r.on || []).some(o => o.kind === 'concept' && o.id === n.id)).length;
+    body = `${all >= 3 ? `<div class="note">You already have ${all} resources here. Another one rarely helps as much as recalling and practicing with what you have. Learn, recall, practice first.</div>` : ''}${PREP.resourcesHTML({ kind: 'concept', id: n.id })}
+      ${rs.length ? `<div><div class="sheet-label" style="margin-top:12px">Links saved in an earlier version</div><div class="list">${rs.map(r => `<div class="li"><span class="tag">${esc(r.kind || 'Link')}</span><div class="grow"><div class="title">${r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.title || r.url)}</a>` : esc(r.title)}</div></div><button class="iconbtn" data-a="res-del" data-rid="${r.id}">Remove</button></div>`).join('')}</div></div>` : ''}`;
   } else if (tab === 'related') {
     const pre = (n.prereq || []).map(N).filter(Boolean), dep = (d.dependents[id] || []).map(N).filter(Boolean);
     const sib = (d.kids[n.parentId] || []).filter(x => x.kind === 'concept' && x.id !== id);
@@ -1235,7 +1332,7 @@ function viewHistory() {
   return `<div class="page-head"><div><h1>Session history</h1><p>Every session, timer-tracked or entered by hand, kept separate so your totals stay trustworthy. Edits never hide where the time came from.</p></div>
     <div class="row"><button class="btn primary" data-a="manual-open">Add past study</button></div></div>
     <div class="panel stack"><label class="f" for="nl-box">Log study in your own words</label>
-      <div class="row"><input type="text" id="nl-box" placeholder="I studied transformer voltage regulation for 45 minutes yesterday" style="flex:1;min-width:240px" data-enter="nl-log"><button class="btn" data-a="nl-log"${ui.nlBusy ? ' disabled' : ''}>${ui.nlBusy ? 'Reading…' : 'Log it'}</button></div>
+      <div class="row"><input type="text" id="nl-box" placeholder="I studied percentages for 45 minutes yesterday" style="flex:1;min-width:240px" data-enter="nl-log"><button class="btn" data-a="nl-log"${ui.nlBusy ? ' disabled' : ''}>${ui.nlBusy ? 'Reading…' : 'Log it'}</button></div>
       <p class="tiny muted">You will confirm before anything is saved. If a timer session already covers it, your figure is stored as self-reported next to the timer's time instead of replacing it.</p></div>
     <div class="row" style="margin:18px 0 8px">
       <select data-c="hist" data-k="subj" style="width:auto">${opt('', 'All subjects', o.subj)}${d.subjects.map(s => opt(s.id, s.name, o.subj)).join('')}</select>
@@ -1581,7 +1678,7 @@ function viewCoach() {
   <div class="chat">${C.msgs.map((m, k) => `<div class="msg ${m.role}"${m.live ? ' id="msg-live"' : ''}><span class="mt">${esc(m.text)}</span>${m.src ? `<div class="tiny muted" style="margin-top:6px">${m.src === 'data' ? 'From your data' : 'Claude, from a summary of your data. Check anything surprising.'}</div>` : ''}${(m.actions || []).length ? `<div class="row" style="margin-top:10px">${m.actions.map(x => `<button class="btn sm" data-a="${x[0]}" data-v="${esc(x[2])}">${esc(x[1])}</button>`).join('')}</div>` : ''}${m.role === 'ai' && m.src === 'data' && aiOn() && k === C.msgs.length - 1 && !C.busy ? '<div style="margin-top:8px"><button class="btn sm ghost" data-a="coach-ai">Discuss this with Claude</button></div>' : ''}</div>`).join('')}
     ${C.busy ? '<div class="row"><span class="small muted">Thinking…</span><button class="btn sm ghost" data-a="coach-stop">Stop</button></div>' : ''}</div>
   ${!C.msgs.length ? `<div class="chips" style="margin:6px 0 16px">${sug.map(s => `<button class="chip" data-a="coach-chip" data-v="${esc(s)}">${esc(s)}</button>`).join('')}</div>` : ''}
-  <div class="row" style="margin-top:16px;max-width:760px"><input type="text" id="coach-in" placeholder="Ask about your study, or log it: I studied phasors for 40 minutes" style="flex:1" data-enter="coach-send"${C.busy ? ' disabled' : ''}><button class="btn primary" data-a="coach-send"${C.busy ? ' disabled' : ''}>Send</button></div><div id="chat-end"></div>`;
+  <div class="row" style="margin-top:16px;max-width:760px"><input type="text" id="coach-in" placeholder="Ask about your study, or log it: I studied ratios for 40 minutes" style="flex:1" data-enter="coach-send"${C.busy ? ' disabled' : ''}><button class="btn primary" data-a="coach-send"${C.busy ? ' disabled' : ''}>Send</button></div><div id="chat-end"></div>`;
 }
 async function coachAsk(q, forceAI) {
   const C = ui.coach; if (C.busy) return;
@@ -1591,7 +1688,8 @@ async function coachAsk(q, forceAI) {
     if (loc) { C.msgs.push({ role: 'ai', text: loc.text, src: 'data', actions: loc.actions }); renderMain(); return; }
     if (!aiOn()) { C.msgs.push({ role: 'ai', text: 'I can answer from your data on: study time for any day, week or subject; what you studied on a date; what to study now for a given number of minutes; neglected subjects; what you are likely to forget; weak concepts; repeated mistakes; concepts not reviewed in N days; and a single concept by name. AI answers are not available in this view.', src: 'data' }); renderMain(); return; }
   }
-  const RULES = 'You are the study coach inside Logbook, a study tracker for competitive exams (GATE, ESE, PSU, JE). Answer ONLY from the DATA below. If the data does not contain what is needed, say so plainly. Never invent study time, dates or scores. Do not claim that a study method caused an outcome. Be neutral and practical; no guilt, no hype. Keep answers short: plain text, short paragraphs or simple lines starting with "• ", no markdown headings or bold. When you recommend what to do, name specific concepts or subjects from the data.\n\nDATA\n' + coachDigest();
+  const exName = (activeExam() || {}).name || 'their exam';
+  const RULES = 'You are the study coach inside Logbook PrepOS, a preparation planner. The student is preparing for ' + exName + '. Answer ONLY from the DATA below. If the data does not contain what is needed, say so plainly. Never invent study time, dates or scores. Do not claim that a study method caused an outcome. Be neutral and practical; no guilt, no hype. Keep answers short: plain text, short paragraphs or simple lines starting with "• ", no markdown headings or bold. When you recommend what to do, name specific concepts or subjects from the data.\n\nDATA\n' + coachDigest();
   const turns = C.msgs.filter(m => m.role === 'me' || (m.role === 'ai' && m.text)).slice(-8).map(m => ({ role: m.role === 'me' ? 'user' : 'assistant', content: m.text }));
   while (turns.length && turns[0].role !== 'user') turns.shift();
   if (forceAI) turns.push({ role: 'user', content: 'Explain that in more depth using my data, and tell me what to do next.' });
@@ -1632,13 +1730,15 @@ function viewSettings() {
     <button class="iconbtn" data-a="exam-archive" data-id="${e.id}">${e.archived ? 'Unarchive' : 'Archive'}</button><button class="iconbtn" data-a="exam-del" data-id="${e.id}">Delete</button></div>`).join('');
   const mix = ['early', 'middle', 'final'].map(p => `<tr><td>${p[0].toUpperCase() + p.slice(1)}</td>${['review', 'new', 'practice', 'mistakes', 'cumulative'].map(k => `<td><input type="number" min="0" max="100" data-c="set" data-k="mix.${p}.${k}" data-t="pct" value="${Math.round(S.mix[p][k] * 100)}" style="width:72px"></td>`).join('')}</tr>`).join('');
   return `<div class="page-head"><div><h1>Settings</h1><p>Everything here is yours to change. Defaults are reasonable starting points, not rules.</p></div></div>
-  <section class="block" style="margin-top:0"><h2 style="margin-bottom:10px">Exams</h2><div class="panel"><div class="list">${exams || '<div class="li muted">No exams yet.</div>'}</div>
-    <div class="row" style="margin-top:12px"><input type="text" id="exam-new-name" placeholder="Exam name, e.g. ESE 2027 Prelims" style="max-width:280px"><input type="date" id="exam-new-date" style="width:auto"><button class="btn sm" data-a="exam-add">Add exam</button></div>
-    <p class="tiny muted" style="margin-top:8px">GATE 2027 is scheduled for 6, 7, 13, 14, 20 and 21 February 2027. Set the exact date of your paper when the paper-wise schedule is published. Subjects can be linked to several exams from the subject's Edit dialog.</p></div></section>
+  ${PREP.settingsDataHTML()}
+  <section class="block"><h2 style="margin-bottom:10px">Exams</h2><div class="panel"><div class="list">${exams || '<div class="li muted">No exams yet.</div>'}</div>
+    <div class="row" style="margin-top:12px"><input type="text" id="exam-new-name" placeholder="Another exam, e.g. a second paper" style="max-width:280px"><input type="date" id="exam-new-date" style="width:auto"><button class="btn sm" data-a="exam-add">Add exam</button></div>
+    <p class="tiny muted" style="margin-top:8px">The active exam drives the countdown, roadmap and plan. Subjects can be linked to several exams from the subject's Edit dialog.</p></div></section>
   <section class="block"><h2 style="margin-bottom:10px">You</h2><div class="panel grid2"><label class="f">Name (for the greeting)<input type="text" data-c="set" data-k="name" value="${esc(S.name)}"></label>
     <label class="f">Theme<select data-c="set" data-k="theme">${[['auto', 'Match device'], ['light', 'Light'], ['dark', 'Dark']].map(x => opt(x[0], x[1], S.theme)).join('')}</select></label></div></section>
+  ${PREP.settingsPrepHTML()}
   <section class="block"><h2 style="margin-bottom:10px">Time targets</h2><div class="panel grid3"><label class="f">Daily (minutes)${numIn('dailyMin', S.dailyMin, 'min="10"')}</label><label class="f">Weekly (minutes)${numIn('weeklyMin', S.weeklyMin, 'min="0"')}</label><label class="f">Monthly (minutes)${numIn('monthlyMin', S.monthlyMin, 'min="0"')}</label>
-    <label class="f">Usual time available per day (minutes)${numIn('avail', S.avail || S.dailyMin, 'min="10"')}</label></div></section>
+    <p class="tiny muted" style="grid-column:1/-1">Targets are for the charts and streak. The plan uses the study time under Preparation.</p></div></section>
   <section class="block"><h2 style="margin-bottom:10px">Daily learning goals</h2><div class="panel grid3"><label class="f">New concepts${numIn('goal.newConcepts', S.goal.newConcepts, 'min="0"')}</label><label class="f">Recalls${numIn('goal.reviews', S.goal.reviews, 'min="0"')}</label><label class="f">Questions${numIn('goal.questions', S.goal.questions, 'min="0"')}</label></div></section>
   <section class="block"><h2 style="margin-bottom:10px">Memory and reviews</h2><div class="panel stack"><div class="grid3">
     <label class="f">Retention target<select data-c="set" data-k="retention" data-t="num">${[0.8, 0.85, 0.88, 0.9, 0.92, 0.95].map(v => opt(v, Math.round(v * 100) + '%' + (v === 0.9 ? ' (default)' : ''), S.retention)).join('')}</select></label>
@@ -1652,9 +1752,7 @@ function viewSettings() {
     <div class="scroll-x"><table class="t"><thead><tr><th>Phase</th><th>Review</th><th>New</th><th>Practice</th><th>Mistakes</th><th>Cumulative</th></tr></thead><tbody>${mix}</tbody></table></div>
     <div class="sheet-label">Review priority weights</div><div class="grid3">${['overdue', 'risk', 'importance', 'prereq', 'lapses'].map(k => `<label class="f">${{ overdue: 'Overdue', risk: 'Forgetting risk', importance: 'Importance', prereq: 'Prerequisite of current work', lapses: 'Past lapses' }[k]}${numIn('weights.' + k, S.weights[k], 'min="0" step="0.5"')}</label>`).join('')}</div>
     <div><button class="btn sm" data-a="planner-reset">Restore planner defaults</button></div></div></section>
-  <section class="block"><h2 style="margin-bottom:10px">Your data</h2><div class="panel stack"><p class="small">Stored in ${esc(CFG.storage || 'your storage')} as JSON files, with a copy in this browser for instant loading and offline use. ${Store.error ? 'Last save problem: ' + esc(Store.error) + '. ' : ''} ${Object.keys(Store.docs).length} data files, ${derive().sessions.length} sessions, ${derive().reviews.length} recalls.</p>
-    <div class="row"><button class="btn sm" data-a="export-json">Export full backup (JSON)</button><button class="btn sm" data-a="export-csv">Export sessions (CSV)</button>
-      <label class="btn sm" style="cursor:pointer">Import backup<input type="file" accept=".json,application/json" data-c="import" class="sr"></label><button class="btn sm danger" data-a="reset-all">Erase everything</button></div></div></section>`;
+  ${PREP.settingsMoreDataHTML()}`;
 }
 function setPath(obj, path, v) { const ks = path.split('.'); let o = obj; for (let i = 0; i < ks.length - 1; i++) o = o[ks[i]] || (o[ks[i]] = {}); o[ks[ks.length - 1]] = v; }
 
@@ -1678,7 +1776,17 @@ function pickerHTML(f, o) {
 }
 function defaultStartF() { return { examId: (activeExam() || {}).id || '', subjectId: '', topicId: '', subtopicId: '', conceptIds: [], mode: 'reading', style: 'stopwatch', minutes: '', confBefore: null, goal: '' }; }
 function openStart(f) { ui.modal = { type: 'start', f: Object.assign(defaultStartF(), f || {}) }; renderModal(); }
-function openPost(s) { if (!s) return; ui.modal = { type: 'post', sid: s.id, lock: true, f: { lv: 'standard', pcid: (s.conceptIds || [])[0] || '' } }; render(); }
+function openPost(s) {
+  if (!s) return;
+  const f = { lv: 'standard', pcid: (s.conceptIds || [])[0] || '' };
+  const l = s.lectureId && derive().lectures.find(x => x.id === s.lectureId);
+  if (l) {
+    const pg = derive().lecProg[l.id], full = (l.min || core().prep.defaultLectureMin) * 60;
+    if (!pg.watch) f.lecWatched = s.taskKind === 'lecture' ? s.focusSec >= full * 0.8 && !/^Watch part/.test(((core().plan || {}).blocks || []).find(b => b.key === s.planBlock)?.title || '') : s.mode === 'lecture' && s.focusSec >= full * 0.8;
+    if (!pg.study) f.lecStudied = s.taskKind === 'selfstudy';
+  }
+  ui.modal = { type: 'post', sid: s.id, lock: true, f }; render();
+}
 function findSession(id) { const r = findIn('ses-', 'sessions', id); return r && r.item; }
 
 const MODALS = {
@@ -1696,14 +1804,19 @@ const MODALS = {
       <div><div class="sheet-label">Timer</div><div class="chips">${STYLES.map(([k, l]) => chip(l, f.style === k, `data-a="fset" data-k="style" data-v="${k}"`)).join('')}</div>
         ${f.style === 'pomodoro' ? `<p class="small muted" style="margin-top:8px">${core().settings.pomo.focus} minutes of focus, then a ${core().settings.pomo.brk}-minute break. Breaks never count as study time.</p>` : f.style !== 'stopwatch' ? `<label class="f" style="margin-top:10px;max-width:220px">Target (minutes)<input type="number" min="1" data-c="fv" data-k="minutes" value="${esc(f.minutes || st[2])}"></label><p class="tiny muted">${f.style === 'mock' ? 'Counts down and stops by itself when time is up.' : f.style === 'deep' ? 'Opens a distraction-free full-screen view.' : 'Chimes at the target; you decide whether to keep going.'}</p>` : '<p class="small muted" style="margin-top:8px">Counts up until you stop.</p>'}</div>
       <details${f.confBefore || f.goal ? ' open' : ''}><summary>Confidence and goal (optional)</summary><div class="stack" style="margin-top:10px"><div><div class="sheet-label">How well do you know this now?</div>${scaleHTML('confBefore', f.confBefore)}</div>
-        <label class="f">Goal for this session<input type="text" data-c="fv" data-k="goal" value="${esc(f.goal)}" placeholder="For example, derive the transformer equivalent circuit from memory"></label></div></details>
+        <label class="f">Goal for this session<input type="text" data-c="fv" data-k="goal" value="${esc(f.goal)}" placeholder="For example, solve ten problems on this topic without notes"></label></div></details>
       <div class="actions"><span class="small muted left kbd-hint"><kbd>N</kbd> opens this from anywhere</span><button class="btn primary lg" data-a="start-go">Start</button></div>` };
   },
   post() {
     const M = ui.modal, s = findSession(M.sid), f = M.f;
     if (!s) return { html: '<p>Session not found.</p><div class="actions"><button class="btn" data-a="close">Close</button></div>' };
     const cs = (s.conceptIds || []).map(N).filter(Boolean);
+    const lec = s.lectureId && derive().lectures.find(x => x.id === s.lectureId), lpg = lec && derive().lecProg[lec.id];
+    const lecBox = lec ? `<div class="note"><div class="small" style="margin-bottom:6px"><strong>${esc(derive().lecLab[lec.id].label)}</strong></div>
+      ${lpg.watch ? '<div class="tiny muted">Watched.</div>' : `<label class="check"><input type="checkbox" data-c="fv" data-k="lecWatched" data-t="bool"${f.lecWatched ? ' checked' : ''}> I finished watching this lecture</label>`}
+      ${lpg.study ? '<div class="tiny muted">Self-study done.</div>' : `<label class="check"><input type="checkbox" data-c="fv" data-k="lecStudied" data-t="bool"${f.lecStudied ? ' checked' : ''}> I finished the self-study for it</label>`}</div>` : '';
     return { html: `<div class="mhead"><div><div class="small muted">Session saved</div><h2>${esc(sesLabel(s))}</h2><p class="small muted">${esc(sesCrumb(s))}</p></div></div>
+      ${lecBox}
       <div class="row" style="gap:28px;align-items:flex-end"><div><div class="big-dur">${fmtDur(s.focusSec)}</div><div class="small muted">focused, ${fmtTime(s.startedAt)} to ${fmtTime(s.endedAt)}</div></div>
         <div class="small muted">${s.pausedSec ? 'Paused ' + fmtDur(s.pausedSec) + ' (not counted). ' : ''}${s.idleExcludedSec ? 'Idle gap removed: ' + fmtDur(s.idleExcludedSec) + '. ' : ''}${MODE_NAME[s.mode]}.</div></div>
       ${cs.length ? `<div class="note blue">Recalling straight after studying is one of the most useful things you can do. It takes about ${Math.max(2, Math.round(cs.length * 1.5))} minutes for ${plural(cs.length, 'concept')}. A first review is already booked for tomorrow either way.</div>` : ''}
@@ -1713,7 +1826,8 @@ const MODALS = {
         <div class="grid3"><div><div class="sheet-label">Focus</div>${scaleHTML('focus', f.focus)}</div><div><div class="sheet-label">Difficulty</div>${scaleHTML('difficulty', f.difficulty)}</div><div><div class="sheet-label">Confidence now</div>${scaleHTML('confAfter', f.confAfter)}</div></div>
         <div class="grid3"><label class="f">Questions solved<input type="number" min="0" data-c="fv" data-k="q" value="${esc(f.q || '')}"></label><label class="f">Correct<input type="number" min="0" data-c="fv" data-k="qc" value="${esc(f.qc || '')}"></label>
           <label class="f">Level<select data-c="fv" data-k="lv">${LEVELS.map(l => opt(l[0], l[1], f.lv)).join('')}</select></label></div>
-        ${cs.length > 1 ? `<label class="f">Questions were on<select data-c="fv" data-k="pcid">${cs.map(cn => opt(cn.id, cn.name, f.pcid)).join('')}</select></label>` : ''}</div></details>
+        ${cs.length > 1 ? `<label class="f">Questions were on<select data-c="fv" data-k="pcid">${cs.map(cn => opt(cn.id, cn.name, f.pcid)).join('')}</select></label>` : ''}
+        <p class="tiny muted">A count is enough for practice statistics. To keep a question for spaced re-solving, <button class="linkbtn" data-a="post-qlog">log it individually</button>.</p></div></details>
       <div class="actions"><button class="btn danger left" data-a="post-discard">Discard session</button>${cs.length ? '<button class="btn" data-a="post-practice">Practice now</button><button class="btn primary" data-a="post-recall">Recall now</button>' : ''}<button class="btn${cs.length ? '' : ' primary'}" data-a="post-finish">Finish</button></div>` };
   },
   target() {
@@ -1750,15 +1864,20 @@ const MODALS = {
       <div class="actions"><button class="btn primary" data-a="close">Done</button></div>` };
   },
   more() {
-    return { html: `<div class="mhead"><h2>More</h2><button class="x" data-a="close" aria-label="Close">×</button></div><div class="list">${NAV.filter(n => !['today', 'review', 'subjects'].includes(n[0])).map(([k, l]) => `<div class="li clickable" data-a="nav" data-v="${k}"><div class="grow"><div class="title">${l}</div></div></div>`).join('')}</div><p class="small muted"><span id="save-status-m">${Store.mode === 'account' ? 'Saved to ' + esc(CFG.storage || 'storage') : 'Saved in this browser'}</span></p>` };
+    return { html: `<div class="mhead"><h2>More</h2><button class="x" data-a="close" aria-label="Close">×</button></div><div class="list">${NAV.filter(n => !['today', 'review', 'subjects'].includes(n[0])).map(([k, l]) => `<div class="li clickable" data-a="nav" data-v="${k}"><div class="grow"><div class="title">${l}</div></div></div>`).join('')}</div><p><button class="save-status" data-a="storage-open">${(() => { const i = saveStatusInfo(); return `<span class="sdot ${i.tone}" aria-hidden="true"></span><span>${esc(i.text)}</span>`; })()}</button></p>` };
   },
   subject() {
     const M = ui.modal, f = M.f, c = core();
     return { html: `<div class="mhead"><h2>${M.id ? 'Edit subject' : 'Add subject'}</h2><button class="x" data-a="close" aria-label="Close">×</button></div>
       <label class="f">Name<input type="text" data-c="fv" data-k="name" value="${esc(f.name)}" data-enter="subj-save"></label>
       ${c.exams.length ? `<div><div class="sheet-label">Exams it belongs to</div><div class="chips">${c.exams.map(e => chip(esc(e.name), f.examIds.includes(e.id), `data-a="subj-exam-t" data-id="${e.id}"`)).join('')}</div></div>` : ''}
-      <div class="grid2"><label class="f">Importance<select data-c="fv" data-k="imp">${[[3, 'High'], [2, 'Medium'], [1, 'Low']].map(x => opt(x[0], x[1], f.imp)).join('')}</select></label>
-        <label class="f">Planned share of study time (%)<input type="number" min="0" max="100" data-c="fv" data-k="share" value="${esc(f.share)}"></label></div>
+      <div class="grid3"><label class="f">Importance for the exam<select data-c="fv" data-k="imp">${[[3, 'High'], [2, 'Medium'], [1, 'Low']].map(x => opt(x[0], x[1], f.imp)).join('')}</select></label>
+        <label class="f">Difficulty for you<select data-c="fv" data-k="diff">${[[1, 'Easy'], [2, 'Medium'], [3, 'Hard']].map(x => opt(x[0], x[1], f.diff)).join('')}</select></label>
+        <label class="f">Priority<select data-c="fv" data-k="priority">${[[3, 'Do first'], [2, 'Normal'], [1, 'Later']].map(x => opt(x[0], x[1], f.priority)).join('')}</select></label></div>
+      <div class="grid3"><label class="f">Estimated study time, hours (optional)<input type="number" min="0" step="1" data-c="fv" data-k="estHours" value="${esc(f.estHours || '')}"></label>
+        <label class="f">Finish learning by (optional)<input type="date" data-c="fv" data-k="targetDate" value="${esc(f.targetDate || '')}"></label>
+        <label class="f">Planned share of time, % (optional)<input type="number" min="0" max="100" data-c="fv" data-k="share" value="${esc(f.share || '')}" placeholder="Automatic"></label></div>
+      ${derive().subjects.filter(x => x.id !== M.id).length ? `<div><div class="sheet-label">Learn after (prerequisite subjects)</div><div class="chips">${derive().subjects.filter(x => x.id !== M.id && !x.archived).map(x => chip(esc(x.name), (f.prereqSubjects || []).includes(x.id), `data-a="subj-pre-t" data-id="${x.id}"`)).join('')}</div></div>` : ''}
       <div><div class="sheet-label">Colour</div><div class="chips">${PALETTE.map(col => `<button type="button" class="chip" aria-pressed="${f.color === col}" data-a="fset" data-k="color" data-v="${col}" aria-label="Colour ${col}"><span class="dot" style="background:${col};width:16px;height:16px"></span></button>`).join('')}</div></div>
       <label class="f">Description (optional)<input type="text" data-c="fv" data-k="desc" value="${esc(f.desc || '')}"></label>
       <div class="actions"><button class="btn" data-a="close">Cancel</button><button class="btn primary" data-a="subj-save">${M.id ? 'Save' : 'Add subject'}</button></div>` };
@@ -1768,7 +1887,7 @@ const MODALS = {
     const multi = !M.id && M.kind === 'concept';
     return { html: `<div class="mhead"><h2>${M.id ? 'Rename ' + kindName : 'Add ' + kindName + (multi ? 's' : '')}</h2><button class="x" data-a="close" aria-label="Close">×</button></div>
       ${M.parentId ? `<p class="small muted">In ${esc(pathStr(M.parentId))}</p>` : ''}
-      ${multi ? `<label class="f">Concept names, one per line<textarea data-c="fv" data-k="name" style="min-height:120px" placeholder="Phasor diagram of a loaded transformer&#10;Voltage regulation">${esc(f.name)}</textarea></label><p class="tiny muted">A concept is one idea you could be asked to recall on its own.</p>`
+      ${multi ? `<label class="f">Concept names, one per line<textarea data-c="fv" data-k="name" style="min-height:120px" placeholder="Newton's second law&#10;Work–energy theorem">${esc(f.name)}</textarea></label><p class="tiny muted">A concept is one idea you could be asked to recall on its own.</p>`
         : `<label class="f">Name<input type="text" data-c="fv" data-k="name" value="${esc(f.name)}" data-enter="node-save"></label>`}
       <div class="actions"><button class="btn" data-a="close">Cancel</button><button class="btn primary" data-a="node-save">${M.id ? 'Save' : 'Add'}</button></div>` };
   },
@@ -1781,7 +1900,7 @@ const MODALS = {
       <div><div class="sheet-label">Type of mistake</div><div class="chips">${MISTAKE_TYPES.map(([k, l]) => chip(l, f.type === k, `data-a="fset" data-k="type" data-v="${k}"`)).join('')}</div></div>
       <label class="f">Why did it happen?<input type="text" data-c="fv" data-k="why" value="${esc(f.why || '')}"></label>
       <label class="f">Correct reasoning<textarea data-c="fv" data-k="fix" style="min-height:70px">${esc(f.fix || '')}</textarea></label>
-      <div class="grid2"><label class="f">What to remember next time<input type="text" data-c="fv" data-k="remember" value="${esc(f.remember || '')}"></label><label class="f">Source (optional)<input type="text" data-c="fv" data-k="src" value="${esc(f.src || '')}" placeholder="GATE 2021 Q34, test series…"></label></div>
+      <div class="grid2"><label class="f">What to remember next time<input type="text" data-c="fv" data-k="remember" value="${esc(f.remember || '')}"></label><label class="f">Source (optional)<input type="text" data-c="fv" data-k="src" value="${esc(f.src || '')}" placeholder="Paper 2021 Q34, test series…"></label></div>
       <div class="actions">${M.id ? '<button class="btn danger left" data-a="mis-del">Delete</button>' : ''}<button class="btn" data-a="close">Cancel</button><button class="btn primary" data-a="mis-save">Save</button></div>` };
   },
   retry() {
@@ -1790,8 +1909,8 @@ const MODALS = {
     const st = RETRY_STAGES[Math.min(x.stage || 0, 3)];
     return { html: `<div class="mhead"><div><div class="small muted">${esc(st[1])}${x.cid && N(x.cid) ? ', ' + esc(N(x.cid).name) : ''}</div><h2>Retry a mistake</h2></div><button class="x" data-a="close" aria-label="Close">×</button></div>
       <div class="card" style="max-width:none"><div class="prompt" style="font-size:19px">${esc(x.q || '(no question text)')}</div>
-      ${x.stage === 2 ? '<p class="small muted">This stage asks for a similar problem, not the same one. Find one from a PYQ or workbook on the same idea.</p>' : '<p class="small muted">Solve it again without looking at the correct reasoning.</p>'}
-      ${M.shown ? `<div><span class="tag red">${esc(MT_NAME[x.type])}</span></div>${x.why ? `<p><b>Why it went wrong:</b> ${esc(x.why)}</p>` : ''}${x.fix ? `<div class="answer">${esc(x.fix)}</div>` : ''}${x.remember ? `<div class="note">${esc(x.remember)}</div>` : ''}` : ''}</div>
+      ${x.stage === 2 ? '<p class="small muted">This stage asks for a similar problem, not the same one. Find one from a past paper or workbook on the same idea.</p>' : '<p class="small muted">Solve it again without looking at the correct reasoning.</p>'}
+      ${M.shown ? `<div><span class="tag red">${esc(MT_NAME[x.type])}</span></div>${x.why ? `<p><b>Why it went wrong:</b> ${esc(x.why)}</p>` : ''}${x.fix ? `<div class="answer">${esc(x.fix)}</div>` : ''}${x.remember ? `<div class="note">${esc(x.remember)}</div>` : ''}${PREP.mistakeQuestionHTML(x)}` : ''}</div>
       <div class="actions">${M.shown ? '<button class="btn" data-a="retry-res" data-v="wrong">Still wrong</button><button class="btn" data-a="retry-res" data-v="partly">Partly</button><button class="btn primary" data-a="retry-res" data-v="right">Got it right</button>' : `<button class="btn left" data-a="mis-edit" data-id="${x.id}">Edit</button><button class="btn primary" data-a="retry-reveal">I have tried it: show the reasoning</button>`}</div>` };
   },
   manual() {
@@ -1866,6 +1985,12 @@ function savePost() {
     const cid = f.pcid || (s.conceptIds || [])[0];
     if (cid && N(cid)) addPractice({ id: uid('p'), at: s.endedAt, cid, n: q, c: qc, lv: f.lv || 'standard', ses: s.id });
     f.practiceSaved = true;
+  }
+  const l = s.lectureId && derive().lectures.find(x => x.id === s.lectureId);
+  if (l && !f.lectureSaved) {
+    const cl = core().lectures.find(x => x.id === l.id);
+    if (cl) { const t = s.endedAt || Date.now(); if (f.lecWatched && !cl.watchedAt) cl.watchedAt = t; if (f.lecStudied && !cl.studiedAt) cl.studiedAt = t; cl.updatedAt = Date.now(); Store.touch('core'); }
+    f.lectureSaved = true;
   }
   saveSession(s);
   return s;
@@ -2002,20 +2127,21 @@ const ACT = {
   'focus-close': () => { ui.focus = false; if (document.fullscreenElement) document.exitFullscreen().catch(() => { }); renderFocus(); },
   fullscreen: () => { const r = document.documentElement; if (document.fullscreenElement) document.exitFullscreen().catch(() => { }); else if (r.requestFullscreen) r.requestFullscreen().catch(() => toast('Full screen is not available here.')); },
   'more-open': () => { ui.modal = { type: 'more' }; renderModal(); },
-  'onboard-ee': () => {
-    const date = ($('#onb-date') || {}).value || '2027-02-06';
-    const ex = { id: uid('e'), name: 'GATE EE', date, archived: false }; const c = core(); c.exams.push(ex); c.settings.activeExamId = ex.id;
-    seedSyllabus(SEED_EE, ex.id); invalidate(); ensurePlan(true); toast('GATE EE syllabus loaded. Edit anything in Subjects.'); render();
-  },
-  'onboard-empty': () => {
-    const name = (($('#onb-name') || {}).value || '').trim() || 'My exam', date = ($('#onb-date2') || {}).value || '';
-    const ex = { id: uid('e'), name, date, archived: false }; const c = core(); c.exams.push(ex); c.settings.activeExamId = ex.id; Store.touch('core', true);
-    go('subjects'); ui.modal = { type: 'subject', f: { name: '', examIds: [ex.id], imp: 2, share: 10, color: PALETTE[0], desc: '' } }; renderModal();
-  },
   'plan-start': () => { const p = core().plan; const b = p && p.blocks.find(x => x.kind !== 'break' && !blockDone(x)); if (b) blockStart(b.key); else toast("Today's plan is done. Anything more is a bonus."); },
   'plan-rebuild': () => { ensurePlan(true, (core().plan || {}).avail); render(); toast('Plan rebuilt around what is left today.'); },
   'block-start': el => blockStart(el.dataset.k),
-  'block-done': el => { const p = core().plan; if (!p) return; p.done = p.done || {}; const k = el.dataset.k; const b = p.blocks.find(x => x.key === k); if (blockDone(b)) { delete p.done[k]; if ((p.progress[k] || 0) >= b.min * 0.8) p.progress[k] = 0; } else p.done[k] = true; Store.touch('core'); render(); },
+  'block-done': el => {
+    const p = core().plan; if (!p) return; p.done = p.done || {}; const k = el.dataset.k; const b = p.blocks.find(x => x.key === k); if (!b) return;
+    if (blockDone(b)) { delete p.done[k]; if (b.status === 'done') b.status = 'todo'; if ((p.progress[k] || 0) >= b.min * 0.8) p.progress[k] = 0; }
+    else {
+      p.done[k] = true; b.status = 'done';
+      // Completing a lecture task by hand counts as that step of the lecture (a partial watch does not).
+      const l = b.lectureId && core().lectures.find(x => x.id === b.lectureId);
+      if (l && !/^Watch part/.test(b.title)) { const t = Date.now(); if (b.kind === 'lecture' && !l.watchedAt) l.watchedAt = t; if (b.kind === 'selfstudy' && !l.studiedAt) l.studiedAt = t; if ((b.kind === 'recall' || b.kind === 'review') && !l.recalledAt && l.watchedAt) l.recalledAt = t; l.updatedAt = t; }
+    }
+    Store.touch('core'); render();
+  },
+  'post-qlog': () => { const s = savePost(); const cid = s && ((ui.modal.f || {}).pcid || (s.conceptIds || [])[0]); ui.modal = null; PREP.openQuestion({ conceptId: cid || '', subjectId: s ? sesSubject(s) || '' : '', sessionId: s ? s.id : null }); },
   'day-open': el => { ui.modal = { type: 'day', k: el.dataset.k }; renderModal(); },
   concept: el => { ui.modal = { type: 'concept', id: ID(el), tab: el.dataset.tab || 'prompts', f: {} }; renderModal(); },
   'cn-tab': el => { ui.modal.tab = V(el); ui.modal.aiErr = ''; renderModal(); },
@@ -2038,7 +2164,7 @@ const ACT = {
   'rev-reexplain': async () => {
     const r = ui.rev, n = N(r.recoverCid); if (!n || r.reexplainBusy) return; r.reexplainBusy = true; renderMain();
     try {
-      const res = await aiText(`A student preparing for a competitive engineering exam (GATE, ESE, JE) keeps forgetting this concept: "${n.name}" (${pathStr(n.id)}).${n.notes ? ' Their notes: ' + n.notes.slice(0, 1500) : ''}\nExplain it simply in under 170 words: the core idea, why it works, the one formula or rule to remember if there is one, and a common confusion to avoid. Then give one easy recall question on a new line starting with "Try:". Plain text, no markdown.`, { onText: ({ text }) => { const el = $('#reexplain'); if (el) { el.className = 'answer'; el.textContent = text; } } });
+      const res = await aiText(`A student preparing for ${(activeExam() || {}).name || 'an exam'} keeps forgetting this concept: "${n.name}" (${pathStr(n.id)}).${n.notes ? ' Their notes: ' + n.notes.slice(0, 1500) : ''}\nExplain it simply in under 170 words: the core idea, why it works, the one formula or rule to remember if there is one, and a common confusion to avoid. Then give one easy recall question on a new line starting with "Try:". Plain text, no markdown.`, { onText: ({ text }) => { const el = $('#reexplain'); if (el) { el.className = 'answer'; el.textContent = text; } } });
       r.reexplain = res.text;
     } catch (e) { r.reexplain = (e && e.text) || aiErr(e); }
     r.reexplainBusy = false; renderMain();
@@ -2048,12 +2174,15 @@ const ACT = {
   'subj-exam': el => { ui.subj.exam = V(el); renderMain(); },
   'subj-arch': () => { ui.subj.showArch = !ui.subj.showArch; renderMain(); },
   'subj-tab': el => { ui.subj.tab = V(el); renderMain(); },
-  'subj-add': () => { const n = derive().subjects.length; ui.modal = { type: 'subject', f: { name: '', examIds: activeExam() ? [activeExam().id] : [], imp: 2, share: 10, color: PALETTE[n % PALETTE.length], desc: '' } }; renderModal(); },
-  'subj-edit': el => { const s = N(ID(el)); ui.modal = { type: 'subject', id: s.id, f: { name: s.name, examIds: (s.examIds || []).slice(), imp: s.imp || 2, share: s.share || 0, color: s.color || PALETTE[0], desc: s.desc || '' } }; renderModal(); },
+  'subj-add': () => { const n = derive().subjects.length; ui.modal = { type: 'subject', f: { name: '', examIds: activeExam() ? [activeExam().id] : [], imp: 2, diff: 2, priority: 2, share: '', color: PALETTE[n % PALETTE.length], desc: '', prereqSubjects: [] } }; renderModal(); },
+  'subj-edit': el => { const s = N(ID(el)); ui.modal = { type: 'subject', id: s.id, f: { name: s.name, examIds: (s.examIds || []).slice(), imp: s.imp || 2, diff: s.diff || 2, priority: s.priority || 2, share: s.share || '', estHours: s.estHours || '', targetDate: s.targetDate || '', color: s.color || PALETTE[0], desc: s.desc || '', prereqSubjects: (s.prereqSubjects || []).slice() } }; renderModal(); },
+  'subj-pre-t': el => { const f = ui.modal.f, id = ID(el); f.prereqSubjects = (f.prereqSubjects || []).includes(id) ? f.prereqSubjects.filter(x => x !== id) : (f.prereqSubjects || []).concat(id); renderModal(); },
   'subj-exam-t': el => { const f = ui.modal.f, id = ID(el); f.examIds = f.examIds.includes(id) ? f.examIds.filter(x => x !== id) : f.examIds.concat(id); renderModal(); },
   'subj-save': () => {
     const M = ui.modal, f = M.f, name = (f.name || '').trim(); if (!name) { toast('Give the subject a name.'); return; }
-    const vals = { name, examIds: f.examIds, imp: +f.imp || 2, share: Math.max(0, num(f.share, 0)), color: f.color, desc: f.desc || '' };
+    if (f.targetDate && !isDateKey(f.targetDate)) { toast('The target date is not a valid date.'); return; }
+    const vals = { name, examIds: f.examIds, imp: +f.imp || 2, diff: +f.diff || 2, priority: +f.priority || 2, share: Math.max(0, num(f.share, 0)), estHours: Math.max(0, num(f.estHours, 0)) || null,
+      targetDate: f.targetDate || null, prereqSubjects: (f.prereqSubjects || []).slice(), color: f.color, desc: f.desc || '' };
     if (M.id) { Object.assign(core().nodes.find(n => n.id === M.id), vals); Store.touch('core'); } else addNode('subject', null, name, vals);
     closeModal(); render();
   },
@@ -2082,7 +2211,7 @@ const ACT = {
   'pr-ai': async () => {
     const M = ui.modal, n = N(M.id); if (M.busy) return; M.busy = true; M.aiErr = ''; renderModal();
     try {
-      const r = await aiJson(`Write 4 active-recall prompts for a student preparing for GATE or a similar competitive exam in electrical/electronics engineering. Concept: "${n.name}" (${pathStr(n.id)}).${n.notes ? ' Student notes: ' + n.notes.slice(0, 1200) : ''}\nMix kinds from: free, formula, explain, compare, application, problem. Each answer must be short, correct and checkable. Reply with only a JSON array of objects {"kind","q","a","hint"}. Example: [{"kind":"formula","q":"Write the EMF equation of a transformer.","a":"E = 4.44 f N Φm","hint":"Frequency, turns and peak flux"}]`);
+      const r = await aiJson(`Write 4 active-recall prompts for a student preparing for ${(activeExam() || {}).name || 'an exam'}. Concept: "${n.name}" (${pathStr(n.id)}).${n.notes ? ' Student notes: ' + n.notes.slice(0, 1200) : ''}\nMix kinds from: free, formula, explain, compare, application, problem. Each answer must be short, correct and checkable. Reply with only a JSON array of objects {"kind","q","a","hint"}. Example: [{"kind":"explain","q":"Why does X happen?","a":"Because …","hint":"Think about …"}]`);
       M.drafts = (Array.isArray(r) ? r : []).filter(p => p && p.q).slice(0, 6);
       if (!M.drafts.length) M.aiErr = 'No usable prompts came back. Try again.';
     } catch (e) { M.aiErr = aiErr(e); }
@@ -2100,7 +2229,7 @@ const ACT = {
     const M = ui.modal, n = N(M.id), t = (M.f.tb || '').trim(); if (!t) { toast('Write your explanation first.'); return; } if (M.busy) return;
     M.busy = true; M.aiErr = ''; renderModal();
     try {
-      const r = await aiJson(`You are checking a student's teach-back explanation for an engineering competitive exam (GATE/ESE/JE level). Concept: "${n.name}" (${pathStr(n.id)}).\nStudent explanation:\n"""${t.slice(0, 6000)}"""\nJudge only technical accuracy and completeness. Reply with only a JSON object: {"score": 0-100, "correct": [short strings], "missing": [short strings], "misconceptions": [short strings], "relationships": [links to other concepts worth making], "next": "one sentence on what to do next"}. Example: {"score":70,"correct":["States the EMF equation"],"missing":["No mention of core loss"],"misconceptions":[],"relationships":["Connect to the equivalent circuit"],"next":"Recall the loss components tomorrow."}`);
+      const r = await aiJson(`You are checking a student's teach-back explanation. They are preparing for ${(activeExam() || {}).name || 'an exam'}. Concept: "${n.name}" (${pathStr(n.id)}).\nStudent explanation:\n"""${t.slice(0, 6000)}"""\nJudge only technical accuracy and completeness. Reply with only a JSON object: {"score": 0-100, "correct": [short strings], "missing": [short strings], "misconceptions": [short strings], "relationships": [links to other concepts worth making], "next": "one sentence on what to do next"}. Example: {"score":70,"correct":["States the main rule"],"missing":["No example of when it applies"],"misconceptions":[],"relationships":["Connect to the related concept"],"next":"Recall the missing part tomorrow."}`);
       if (!r || typeof r.score !== 'number') throw { code: 'invalid_json' };
       r.score = Math.round(clamp(r.score, 0, 100)); M.tbRes = r;
       addTeach({ id: uid('tb'), at: Date.now(), cid: M.id, text: t, score: r.score, ai: true, res: r });
@@ -2124,6 +2253,8 @@ const ACT = {
   'retry-reveal': () => { ui.modal.shown = true; renderModal(); },
   'retry-res': el => {
     const x = derive().mistakes.find(m => m.id === ui.modal.id), d = derive(), v = V(el);
+    // A mistake from a saved question: retrying the same question also updates that question's memory (stage 3 uses a similar problem instead).
+    if (x.qid && d.qById[x.qid] && (x.stage || 0) !== 2) PREP.recordQuestionResult(x.qid, v === 'right' ? 'correct' : v === 'partly' ? 'partial' : 'incorrect', { fromMistake: true });
     x.attempts = (x.attempts || []).concat({ at: Date.now(), r: v, stage: x.stage || 0 });
     if (v === 'right') { x.stage = (x.stage || 0) + 1; if (x.stage >= RETRY_STAGES.length) { x.resolved = true; x.resolvedAt = Date.now(); } else x.next = dayStart(addDays(d.today, RETRY_STAGES[x.stage][0]), d.sh); }
     else if (v === 'partly') x.next = dayStart(addDays(d.today, 1), d.sh);
@@ -2173,9 +2304,12 @@ const ACT = {
   'exam-archive': el => { const e = core().exams.find(x => x.id === ID(el)); e.archived = !e.archived; if (e.archived && core().settings.activeExamId === e.id) core().settings.activeExamId = null; Store.touch('core'); render(); },
   'exam-del': el => { const id = ID(el), e = core().exams.find(x => x.id === id); askConfirm({ title: 'Delete ' + e.name + '?', text: 'Subjects stay, but lose their link to this exam. Sessions keep their time.', yes: 'Delete', danger: true, fn: () => { const c = core(); c.exams = c.exams.filter(x => x.id !== id); c.nodes.forEach(n => { if (n.examIds) n.examIds = n.examIds.filter(x => x !== id); }); if (c.settings.activeExamId === id) c.settings.activeExamId = null; Store.touch('core'); render(); } }); },
   'planner-reset': () => { const S = core().settings; S.mix = clone(DEFAULT_MIX); S.weights = clone(DEFAULT_WEIGHTS); Store.touch('core'); render(); toast('Planner defaults restored.'); },
-  'export-json': () => saveFile('logbook-backup-' + derive().today + '.json', exportDocs(), 'Backup'),
+  'export-json': () => PREP.exportCopy(),
   'export-csv': () => saveFile('logbook-sessions-' + derive().today + '.csv', sessionsCSV(), 'Sessions CSV'),
-  'reset-all': () => askConfirm({ title: 'Erase everything?', text: 'All sessions, syllabus, reviews and settings will be deleted from this browser and your account. Export a backup first if you might want it.', yes: 'Erase everything', danger: true, typeWord: 'ERASE', fn: () => { if (core().active) { core().active = null; } replaceAll({}); go('today'); toast('Everything erased.'); } })
+  'reset-all': () => askConfirm({ title: 'Erase everything?', text: 'All sessions, syllabus, reviews and settings will be deleted from this browser and your account. Export a backup first if you might want it.', yes: 'Erase everything', danger: true, typeWord: 'ERASE', fn: async () => {
+    // Unlink the preparation file first so autosave can never overwrite it with an empty preparation.
+    if (FS) await FS.forget();
+    if (core().active) { core().active = null; } replaceAll({}); go('today'); toast('Everything in this browser was erased. The progress file on your computer was unlinked, not deleted.'); } })
 };
 
 const CHG = {
@@ -2206,14 +2340,8 @@ const CHG = {
     toast('Saved.');
   },
   'exam-f': (el, e) => { if (e.type !== 'change') return; const ex = core().exams.find(x => x.id === ID(el)); if (!ex) return; ex[el.dataset.k] = el.value; Store.touch('core'); invalidate(); renderNav(); toast('Saved.'); },
-  import: async (el, e) => {
-    if (e.type !== 'change') return; const file = el.files && el.files[0]; if (!file) return;
-    let data = null; try { data = JSON.parse(await file.text()); } catch (err) { toast('That file is not a Logbook backup.'); return; }
-    if (!data || data.app !== 'logbook' || !data.docs || !data.docs.core) { toast('That file is not a Logbook backup.'); return; }
-    const n = Object.values(data.docs).reduce((a, x) => a + ((x && x.sessions) || []).length, 0);
-    askConfirm({ title: 'Replace your data with this backup?', text: `The backup from ${esc(data.exportedAt || 'an unknown date')} has ${n} sessions. Everything currently stored will be replaced.`, yes: 'Replace', danger: true, fn: () => { replaceAll(data.docs); toast('Backup imported.'); } });
-    el.value = '';
-  }
+  /* Any preparation file, old full backup, or the separate data files of the old storage (select several). */
+  import: async (el, e) => { if (e.type !== 'change') return; await PREP.importFiles(el.files); el.value = ''; }
 };
 
 /* =====================================================================
@@ -2258,24 +2386,50 @@ let mounted = false;
 export function mountLogbook(cfg) {
   if (mounted) return; mounted = true;
   CFG = cfg || {};
+  CFG.server = !!CFG.server;
   LS = 'lb1:' + (CFG.uid || 'local') + ':';
   CAP.ai = CFG.ai ? 'on' : 'off';
+  Object.assign(ACT, PREP.ACT); Object.assign(CHG, PREP.CHG); Object.assign(MODALS, PREP.MODALS);
   Store.loadLocal(); normalizeCore(); routeFromHash();
+  if (Store.adopted) setTimeout(() => toast('Loaded the data this browser kept from your earlier sign-in. Save it to a preparation file to keep it safe.'), 600);
+  FS = new FileSync({ kv: idbKV(), pickers: browserPickers(), getDocs: () => Store.docs, applyDocs: (docs, mode) => Store.setDocs(docs, mode), workspaceId: () => core().wsid,
+    onStatus: st => { setSaveStatus(); if (st.message && st.message !== ui.fsMsg && /merged|Converted/.test(st.message)) toast(st.message); ui.fsMsg = st.message; } });
   ui.lastDay = derive().today;
   document.addEventListener('click', onClick);
-  document.addEventListener('input', e => { const el = e.target.closest ? e.target.closest('[data-c]') : null; if (el && ['fv', 'rev-answer', 'hist'].includes(el.dataset.c)) onField(e); });
+  document.addEventListener('input', e => { const el = e.target.closest ? e.target.closest('[data-c]') : null; if (el && ['fv', 'rev-answer', 'hist', 'wiz', 'wiz-s', 'wiz-l', 'qsearch', 'qrev-f', 'syl-text'].includes(el.dataset.c)) onField(e); });
   document.addEventListener('change', onField);
   document.addEventListener('keydown', onKey);
   window.addEventListener('hashchange', () => { if (skipHash && skipHash === location.hash) { skipHash = null; return; } skipHash = null; routeFromHash(); if (ui.modal && ui.modal.type === 'more') ui.modal = null; renderNav(); renderMain(); renderModal(); });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') { if (core().active) beat(); Store.flush(); }
+    if (document.visibilityState === 'hidden') { if (core().active) beat(); if (Store.remote) Store.flush(); FS.flush(); }
     else { tick(); invalidate(); if (derive().today !== ui.lastDay) { ui.lastDay = derive().today; if (!ui.modal && !ui.rev) render(); } }
   });
-  window.addEventListener('pagehide', () => { if (core().active) beat(); Store.flushOnExit(); });
-  window.addEventListener('online', () => { if (Store.remote) Store.flush(); else Store.connect(); });
+  window.addEventListener('pagehide', () => { if (core().active) beat(); if (Store.remote) Store.flushOnExit(); FS.flush(); });
+  window.addEventListener('online', () => { if (!CFG.server) return; if (Store.remote) Store.flush(); else Store.connect(); });
   render();
+  // The linked preparation file (if any). The page works from the browser copy meanwhile.
+  FS.init().then(async st => {
+    if (st.state === 'nofile' && !derive().subjects.length && !derive().sessions.length) {
+      const r = await FS.recovery('last');
+      if (r && r.docs && r.docs.core) { Store.setDocs(r.docs, 'replace'); toast('Restored your preparation from this browser’s recovery copy.'); }
+    }
+    setSaveStatus();
+  }).catch(e => { console.error(e); setSaveStatus(); });
+  if (CFG.sw && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { });
   setInterval(tick, 1000);
   setInterval(() => { const k = dayKey(Date.now(), core().settings.dayStartHour); if (k !== ui.lastDay) { ui.lastDay = k; invalidate(); if (!ui.modal && !ui.rev && !typing(document.activeElement)) render(); } }, 60000);
   resumeCheck();
   Store.connect();
 }
+
+/* Shared with client/prep-ui.js (the setup wizard, dashboard, roadmap, lectures and practice views). */
+export {
+  $, esc, clone, plural, pct, uid, sum, addDays, daysBetween, dayKey, dayStart, keyToDate, fmtDur, fmtClock, fmtTime, fmtDate, fmtDay, fmtDayLong, DAY, HOUR, MIN,
+  Memory, STATES, DEFAULT_SETTINGS, KIND_NAME, PHASE_TEXT, MISTAKE_TYPES, MT_NAME, PALETTE, LEVELS, MODE_NAME,
+  CFG, Store, FS, ui, N, core, derive, model, makeSnapshot, planCtx, normMix, activeExam, daysLeft, examSubjects, conceptsUnder, liveConcepts, isLiveConcept, impOf,
+  pathStr, subjColor, subjName, conceptNames, sesLabel, sesSubject, sesRow, todayLearning, planBlockSub, studiedSec, availOn, windowsOn, subjectsPerDayOn, extraPerDay,
+  openMistakes, questionSubject, missedInfo, ensurePlan, projectWeek, rebaseline, blockDone, blockDoneIn, blockStart, dayOptsFor, nowMinOfDay, rolloverPlans,
+  saveQuestion, addQAttempt, removeQuestion, saveMistake, addPractice, addReview, memOpts, maxIvlNow, misDue, dueCount, riskList, focusNow, startSession, openStart,
+  toast, go, render, renderMain, renderModal, renderNav, closeModal, askConfirm, saveStatusInfo, setSaveStatus, freshCore, replaceAll, saveFile, exportDocs,
+  chip, opt, stat, hbar, dot, stateTag, pickerHTML, scaleHTML, relDue, greeting, phaseText, invalidate, addNode, promptsFor, setPrompts, beginReview, sumRange
+};

@@ -1,0 +1,694 @@
+{
+ "format": "logbook-syllabus",
+ "note": "Example syllabus for GATE Electrical Engineering, kept from the original Logbook template. Import it from Subjects, Import syllabus. Importance (1-3) and the subject order are starting estimates, not official weightage. Subjects are listed in a suggested learning order.",
+ "subjects": [
+  {
+   "subject": "Engineering Mathematics",
+   "importance": 3,
+   "why": "Linear algebra, calculus and ODEs feed circuits, signals and control. Complex variables and probability can come later.",
+   "topics": [
+    {
+     "topic": "Linear Algebra",
+     "concepts": [
+      "Matrix algebra",
+      "Systems of linear equations",
+      "Eigenvalues and eigenvectors"
+     ]
+    },
+    {
+     "topic": "Calculus",
+     "concepts": [
+      "Mean value theorems",
+      "Definite and improper integrals",
+      "Partial derivatives",
+      "Maxima and minima",
+      "Multiple integrals",
+      "Fourier series",
+      "Vector identities and directional derivatives",
+      "Line, surface and volume integrals",
+      "Stokes, Gauss and Green's theorems"
+     ]
+    },
+    {
+     "topic": "Differential Equations",
+     "concepts": [
+      "First-order equations (linear and nonlinear)",
+      "Higher-order linear ODEs with constant coefficients",
+      "Cauchy–Euler equation",
+      "Variation of parameters",
+      "PDEs and separation of variables",
+      "Initial and boundary value problems"
+     ]
+    },
+    {
+     "topic": "Complex Variables",
+     "concepts": [
+      "Analytic functions",
+      "Cauchy's integral theorem and formula",
+      "Taylor and Laurent series",
+      "Residue theorem"
+     ]
+    },
+    {
+     "topic": "Probability and Statistics",
+     "concepts": [
+      "Sampling theorems",
+      "Conditional probability",
+      "Mean, median, mode and standard deviation",
+      "Random variables",
+      "Poisson, normal and binomial distributions",
+      "Correlation and regression"
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "Electric Circuits",
+   "importance": 3,
+   "why": "Phasors, network theorems and three-phase circuits underpin machines, power systems and power electronics.",
+   "topics": [
+    {
+     "topic": "Network elements",
+     "concepts": [
+      "Ideal voltage and current sources",
+      "Dependent sources",
+      "R, L, C and mutual inductance"
+     ]
+    },
+    {
+     "topic": "Network analysis",
+     "concepts": [
+      "KCL and KVL",
+      {
+       "name": "Node and mesh analysis",
+       "prereq": [
+        "KCL and KVL"
+       ]
+      },
+      "Star–delta transformation"
+     ]
+    },
+    {
+     "topic": "Network theorems",
+     "concepts": [
+      {
+       "name": "Thevenin and Norton",
+       "prereq": [
+        "Node and mesh analysis"
+       ]
+      },
+      "Superposition",
+      "Maximum power transfer"
+     ]
+    },
+    {
+     "topic": "Transients",
+     "concepts": [
+      {
+       "name": "Transient response of DC networks",
+       "prereq": [
+        "KCL and KVL",
+        "First-order equations (linear and nonlinear)"
+       ]
+      },
+      "Transient response of AC networks"
+     ]
+    },
+    {
+     "topic": "AC steady state",
+     "concepts": [
+      "Phasors and sinusoidal steady state",
+      "Resonance",
+      {
+       "name": "Complex power and power factor",
+       "prereq": [
+        "Phasors and sinusoidal steady state"
+       ]
+      },
+      {
+       "name": "Balanced three-phase circuits",
+       "prereq": [
+        "Phasors and sinusoidal steady state"
+       ]
+      }
+     ]
+    },
+    {
+     "topic": "Two-port networks",
+     "concepts": [
+      "Two-port parameters"
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "Electromagnetic Fields",
+   "importance": 2,
+   "why": "Magnetic circuits and inductance are the physics behind transformers and machines.",
+   "topics": [
+    {
+     "topic": "Electrostatics",
+     "concepts": [
+      "Coulomb's law and electric field intensity",
+      "Electric flux density and Gauss's law",
+      "Divergence",
+      "Fields and potential of point, line, plane and spherical charges",
+      "Effect of dielectric medium",
+      "Capacitance of simple configurations"
+     ]
+    },
+    {
+     "topic": "Magnetostatics",
+     "concepts": [
+      "Biot–Savart law",
+      "Ampère's law and curl",
+      "Faraday's law",
+      "Lorentz force",
+      "Self and mutual inductance",
+      "MMF, reluctance and magnetic circuits"
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "Signals and Systems",
+   "importance": 3,
+   "why": "Laplace and Fourier tools are needed for control systems and converter harmonics.",
+   "topics": [
+    {
+     "topic": "Signals",
+     "concepts": [
+      "Continuous and discrete-time signals",
+      "Shifting and scaling",
+      "RMS and average value of periodic waveforms"
+     ]
+    },
+    {
+     "topic": "Systems",
+     "concepts": [
+      "LTI and causal systems"
+     ]
+    },
+    {
+     "topic": "Fourier analysis",
+     "concepts": [
+      "Fourier series of periodic signals",
+      "Fourier transform applications",
+      "Sampling theorem"
+     ]
+    },
+    {
+     "topic": "Transforms",
+     "concepts": [
+      {
+       "name": "Laplace transform",
+       "prereq": [
+        "Higher-order linear ODEs with constant coefficients"
+       ]
+      },
+      "z-transform"
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "Electrical Machines",
+   "importance": 3,
+   "why": "Needs circuits and magnetic circuits. Power systems uses its machine models.",
+   "topics": [
+    {
+     "topic": "Single-phase transformer",
+     "concepts": [
+      {
+       "name": "Equivalent circuit and phasor diagram",
+       "prereq": [
+        "Phasors and sinusoidal steady state",
+        "MMF, reluctance and magnetic circuits"
+       ]
+      },
+      {
+       "name": "Open-circuit and short-circuit tests",
+       "prereq": [
+        "Equivalent circuit and phasor diagram"
+       ]
+      },
+      {
+       "name": "Voltage regulation",
+       "prereq": [
+        "Equivalent circuit and phasor diagram",
+        "Open-circuit and short-circuit tests"
+       ]
+      },
+      {
+       "name": "Transformer efficiency",
+       "prereq": [
+        "Open-circuit and short-circuit tests"
+       ]
+      }
+     ]
+    },
+    {
+     "topic": "Three-phase transformers",
+     "concepts": [
+      "Connections and vector groups",
+      "Parallel operation of transformers",
+      "Auto-transformer"
+     ]
+    },
+    {
+     "topic": "Energy conversion",
+     "concepts": [
+      "Electromechanical energy conversion principles"
+     ]
+    },
+    {
+     "topic": "DC machines",
+     "concepts": [
+      "Separately excited, series and shunt machines",
+      "Motoring and generating characteristics",
+      "Speed control of DC motors"
+     ]
+    },
+    {
+     "topic": "Induction machines",
+     "concepts": [
+      "Induction motor principle and types",
+      {
+       "name": "Induction motor equivalent circuit",
+       "prereq": [
+        "Equivalent circuit and phasor diagram"
+       ]
+      },
+      {
+       "name": "Torque–speed characteristics",
+       "prereq": [
+        "Induction motor equivalent circuit"
+       ]
+      },
+      "No-load and blocked-rotor tests",
+      "Starting and speed control",
+      "Single-phase induction motor principle"
+     ]
+    },
+    {
+     "topic": "Synchronous machines",
+     "concepts": [
+      "Cylindrical and salient pole machines",
+      "Synchronous machine performance and characteristics",
+      {
+       "name": "Regulation of alternators",
+       "prereq": [
+        "Synchronous machine performance and characteristics",
+        "Phasors and sinusoidal steady state"
+       ]
+      },
+      "Parallel operation of alternators",
+      "Starting of synchronous motors"
+     ]
+    },
+    {
+     "topic": "Losses and efficiency",
+     "concepts": [
+      "Losses and efficiency of machines"
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "Power Systems",
+   "importance": 3,
+   "why": "Builds on per-unit, three-phase circuits and machine models.",
+   "topics": [
+    {
+     "topic": "Generation and transmission",
+     "concepts": [
+      "Power generation concepts",
+      "AC and DC transmission concepts",
+      "Transmission line models and performance",
+      "Cables"
+     ]
+    },
+    {
+     "topic": "Compensation and insulation",
+     "concepts": [
+      "Series and shunt compensation",
+      "Electric field distribution and insulators"
+     ]
+    },
+    {
+     "topic": "Distribution and per-unit",
+     "concepts": [
+      "Distribution systems",
+      "Per-unit quantities"
+     ]
+    },
+    {
+     "topic": "Load flow",
+     "concepts": [
+      {
+       "name": "Bus admittance matrix",
+       "prereq": [
+        "Node and mesh analysis"
+       ]
+      },
+      {
+       "name": "Gauss–Seidel load flow",
+       "prereq": [
+        "Bus admittance matrix"
+       ]
+      },
+      {
+       "name": "Newton–Raphson load flow",
+       "prereq": [
+        "Bus admittance matrix",
+        "Systems of linear equations"
+       ]
+      }
+     ]
+    },
+    {
+     "topic": "Operation and control",
+     "concepts": [
+      "Voltage and frequency control",
+      {
+       "name": "Power factor correction",
+       "prereq": [
+        "Complex power and power factor"
+       ]
+      },
+      "Economic load dispatch"
+     ]
+    },
+    {
+     "topic": "Fault analysis",
+     "concepts": [
+      {
+       "name": "Symmetrical components",
+       "prereq": [
+        "Balanced three-phase circuits"
+       ]
+      },
+      {
+       "name": "Symmetrical fault analysis",
+       "prereq": [
+        "Per-unit quantities",
+        "Thevenin and Norton"
+       ]
+      },
+      {
+       "name": "Unsymmetrical fault analysis",
+       "prereq": [
+        "Symmetrical components",
+        "Per-unit quantities"
+       ]
+      }
+     ]
+    },
+    {
+     "topic": "Protection",
+     "concepts": [
+      "Overcurrent protection",
+      "Differential protection",
+      "Directional protection",
+      "Distance protection",
+      "Circuit breakers"
+     ]
+    },
+    {
+     "topic": "Stability",
+     "concepts": [
+      "System stability concepts",
+      {
+       "name": "Equal area criterion",
+       "prereq": [
+        "System stability concepts"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "Control Systems",
+   "importance": 3,
+   "why": "Builds on Laplace transforms and linear algebra.",
+   "topics": [
+    {
+     "topic": "Modeling",
+     "concepts": [
+      "Mathematical modeling of systems",
+      "Feedback principle",
+      {
+       "name": "Transfer function",
+       "prereq": [
+        "Laplace transform"
+       ]
+      },
+      "Block diagrams",
+      "Signal flow graphs"
+     ]
+    },
+    {
+     "topic": "Time response",
+     "concepts": [
+      "Transient response of LTI systems",
+      "Steady-state error"
+     ]
+    },
+    {
+     "topic": "Stability",
+     "concepts": [
+      {
+       "name": "Routh–Hurwitz criterion",
+       "prereq": [
+        "Transfer function"
+       ]
+      },
+      {
+       "name": "Nyquist criterion",
+       "prereq": [
+        "Bode plots"
+       ]
+      },
+      {
+       "name": "Root locus",
+       "prereq": [
+        "Transfer function"
+       ]
+      }
+     ]
+    },
+    {
+     "topic": "Frequency response",
+     "concepts": [
+      {
+       "name": "Bode plots",
+       "prereq": [
+        "Transfer function"
+       ]
+      }
+     ]
+    },
+    {
+     "topic": "Compensators and controllers",
+     "concepts": [
+      "Lag, lead and lead–lag compensators",
+      "P, PI and PID controllers"
+     ]
+    },
+    {
+     "topic": "State space",
+     "concepts": [
+      "State-space models",
+      {
+       "name": "Solution of state equations",
+       "prereq": [
+        "State-space models",
+        "Eigenvalues and eigenvectors",
+        "Laplace transform"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "Analog and Digital Electronics",
+   "importance": 2,
+   "why": "Largely self-contained; diode basics help power electronics.",
+   "topics": [
+    {
+     "topic": "Diode circuits",
+     "concepts": [
+      "Clipping and clamping",
+      "Rectifiers"
+     ]
+    },
+    {
+     "topic": "Amplifiers",
+     "concepts": [
+      "Amplifier biasing",
+      "Equivalent circuits and frequency response",
+      "Feedback amplifiers",
+      "Oscillators"
+     ]
+    },
+    {
+     "topic": "Operational amplifiers",
+     "concepts": [
+      "Op-amp characteristics and applications",
+      "Single-stage active filters",
+      "Sallen–Key and Butterworth filters",
+      "VCOs and timers"
+     ]
+    },
+    {
+     "topic": "Digital circuits",
+     "concepts": [
+      "Combinational logic circuits",
+      "Sequential logic circuits",
+      "Multiplexers and demultiplexers",
+      "Schmitt triggers",
+      "Sample-and-hold circuits",
+      "A/D and D/A converters"
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "Power Electronics",
+   "importance": 3,
+   "why": "Uses circuits, device basics and Fourier analysis of harmonics.",
+   "topics": [
+    {
+     "topic": "Devices",
+     "concepts": [
+      "Static V–I characteristics of thyristor, MOSFET and IGBT",
+      "Firing and gating circuits"
+     ]
+    },
+    {
+     "topic": "DC–DC converters",
+     "concepts": [
+      "Buck converter",
+      {
+       "name": "Boost converter",
+       "prereq": [
+        "Buck converter"
+       ]
+      },
+      {
+       "name": "Buck–boost converter",
+       "prereq": [
+        "Buck converter",
+        "Boost converter"
+       ]
+      }
+     ]
+    },
+    {
+     "topic": "AC–DC converters",
+     "concepts": [
+      "Uncontrolled rectifiers (1-phase and 3-phase)",
+      "Thyristor-based converters",
+      "Bidirectional AC–DC voltage source converters"
+     ]
+    },
+    {
+     "topic": "Harmonics",
+     "concepts": [
+      {
+       "name": "Line current harmonics",
+       "prereq": [
+        "Fourier series of periodic signals"
+       ]
+      },
+      "Power factor and distortion factor of AC–DC converters"
+     ]
+    },
+    {
+     "topic": "Inverters",
+     "concepts": [
+      "Voltage and current source inverters",
+      {
+       "name": "Sinusoidal PWM",
+       "prereq": [
+        "Voltage and current source inverters"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "Electrical and Electronic Measurements",
+   "importance": 2,
+   "why": "Light and mostly self-contained once circuits are solid.",
+   "topics": [
+    {
+     "topic": "Measurement methods",
+     "concepts": [
+      "Bridges and potentiometers",
+      "Measurement of voltage, current, power, energy and power factor",
+      "Instrument transformers"
+     ]
+    },
+    {
+     "topic": "Instruments",
+     "concepts": [
+      "Digital voltmeters and multimeters",
+      "Phase, time and frequency measurement",
+      "Oscilloscopes"
+     ]
+    },
+    {
+     "topic": "Accuracy",
+     "concepts": [
+      "Error analysis"
+     ]
+    }
+   ]
+  },
+  {
+   "subject": "General Aptitude",
+   "importance": 3,
+   "why": "Parallel track: 10–15 minutes on most days rather than one late block.",
+   "topics": [
+    {
+     "topic": "Verbal aptitude",
+     "concepts": [
+      "Grammar",
+      "Vocabulary",
+      "Reading comprehension",
+      "Narrative sequencing"
+     ]
+    },
+    {
+     "topic": "Quantitative aptitude",
+     "concepts": [
+      "Data interpretation",
+      "Numerical computation and estimation",
+      "Mensuration and geometry",
+      "Elementary statistics and probability"
+     ]
+    },
+    {
+     "topic": "Analytical aptitude",
+     "concepts": [
+      "Logic: deduction and induction",
+      "Analogy",
+      "Numerical relations and reasoning"
+     ]
+    },
+    {
+     "topic": "Spatial aptitude",
+     "concepts": [
+      "Transformation of shapes",
+      "Paper folding and cutting",
+      "2D and 3D patterns"
+     ]
+    }
+   ]
+  }
+ ]
+}
